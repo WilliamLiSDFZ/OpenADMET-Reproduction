@@ -1,0 +1,289 @@
+Description of the Model
+We trained various Chemprop-based multi-task and single-task models. We also fine-tuned with pre-trained Chemprop models based on this work (arxiv.org/pdf/2510.12719).
+
+Training data were combined with proprietary datasets when available. Targets were log10-transformed with the exception of LogD. For CLint and permeability endpoints, 0s are replaced with half of the smallest non-zero values before being log10 transformed. For PPB endpoints, 0s are set to 10^(-6) before being log10-transformed, considering the typical PPB detection limit. Chemprop hyperparameters from our internal Chemprop model were lightly optimized (<20 models trained). No additional descriptors/features were used.
+Performance comments
+Additional data do not always improve the prediction performances on the supplied test set, but do seem to help arrive at a more generalizable model by preventing overfitting. Optimizing the model solely based on the leaderboard results can be misleading. Very different model predictions sometimes give almost identical error metrics on the leaderboard.
+
+---
+
+Overview
+The modelling pipeline splits the challenge dataset into four endpoint categories, each targeting specific ADME properties. Each category is modelled independently, using multitasking only between tasks belonging to the same group.
+
+All models were built using the MATCHA package from Merck Healthcare.
+
+Endpoint Categories
+MPPB, MBPB, MGMB
+
+HLM CLint, MLM CLint
+
+LogD, KSOL
+
+Caco-2 Permeability Papp A>B, Caco-2 Permeability Efflux
+
+Methodology
+Model Architectures
+The final ensemble combines predictions from four complementary architectures:
+
+GatedGCN with a virtual node for enhanced global context (https://arxiv.org/abs/2003.00982)
+GraphGPS as the transformer-based architecture to provide a different inductive bias (https://arxiv.org/abs/2205.12454)
+GIN with laplacian and random-walk positional encodings (https://arxiv.org/pdf/1810.00826)
+Chemprop with RDKIT descriptor concatenation (https://pubs.acs.org/doi/10.1021/acs.jcim.5c02332)
+Pretraining strategies
+Three pretraining datasets were used:
+
+Large
+Sparse multitask dataset encompassing regression and classification on 3D QM properties, RDKIT descriptors, ADME data and biochemical assays. Curriculum was used to adjust task importance during training. The general idea is inspired by this paper: https://arxiv.org/abs/2404.11568
+
+ADME
+Multitask regression-only dataset with ADME-related tasks.
+
+Descriptor-based (CheMeleon)
+Multitask regression on molecular descriptors (https://arxiv.org/abs/2506.15792)
+
+GatedGCN, GraphGPS and GIN models were pretrained using the first dataset, while Chemprop was pretrained using the second one. CheMeleon was used as-is from the Github repo.
+
+Both ADME and Large had a mix of public and internal data.
+
+Finetuning strategies
+Two finetuning strategies were used:
+
+Type A
+Simply finetune on the challenge endpoints, grouped as indicated above
+
+Type B
+Finetune on the grouped challenge endpoints, Jazzy descriptors and most significant MOE descriptors for those endpoints, identified via XGBoost + SHAP. Curriculum was used to adjust task importance during training.
+
+Details
+Optimizer: AdamW with learning rate 1e-3, weight decay 1e-4,
+Pretraining LR: 1e-4 with model-specific decay schedules across the architecture, e.g. making earlier layers with lower LRs.
+Epochs: 200 maximum with early stopping (patience=20)
+Batch Size: 32
+Loss Function: Mean Absolute Error (MAE) in multitask framework, adjusting for sparser endpoints
+Strategy A or B was selected depending on the endpoint and / or algorithm.
+
+Appropriate transformations were applied per endpoint (log10p for most targets, none for LogD).
+
+Each architecture trains an ensemble of 10 models. Each model per algorithm uses different random initializations, and uses a different slice of the training data, obtained via 10-fold CV. The validation set for each CV split is used for early stopping. The CV seeds are different for each algorithm to improve inter-model variability
+
+Final Prediction: Simple averaging across all model predictions
+
+Model selection and performance evaluation
+Splits: I used a time-based sliding window splitting scheme, using the molecular IDs as a proxy for time. The procedure sorts the dataset according to the IDs, then e.g. uses the first 50% of the data as train, and the subset between 50% and 60% as test. Then, repeats training using 60% of the data, and testing using the 60% - 70% set and so forth. The idea is to simulate model deployment and prospective inference, as that matches the train/test setting of the challenge. The procedure is repeated 5 times and performance metrics are averaged across splits
+Consistency with leaderboard: Generally speaking, performance improvements using the splitting scheme described above matched improvements on the leaderboard, but it wasn't always necessarily a match when performance improvements were minor
+Hyperparameter tuning: Final submission used default hyperparameters for pretraining and finetuning
+Model seletion: I tried different pretraining approaches (e.g. increase in model capacity, data curation, data sources, loss curriculum etc) and selected the best ones based on the performance on the sliding window performance
+Performance comments
+Pretrained models generally outperformed models trained from scratch for all endpoints
+For certain endpoints (e.g. CACO), the addition of auxiliary tasks like MOE descriptors or Jazzy was particularly useful, for others it was not important
+Descriptor or fingerprint-based methods were generally outperformed by graph-based methods, but the two approaches had usually low correlation in their residuals. Further work is needed to refine the ensembling strategy
+SMILES-based methods were generally outperformed by graph-based methods. Larger scale pretraining for this modality is needed
+HPO was attempted for the finetuning config, but it was generally quite noisy and did not improve on the leaderboard. Higher trial number likely needed, but I think the gains are likely to be small
+
+---
+
+Methodology Report
+Description of the Model(s)
+We employed a hybrid modelling strategy combining deep learning and classical machine learning approaches to maximise predictive performance and robustness across tasks. For deep learning, we used a multi-task message-passing neural networks (MPNNs) and a graph transformer model. Hyperparameter optimisation was performed using Ray Tune and HyperBand (https://docs.ray.io/en/latest/tune/index.html) which gave some small performance gains.
+
+In parallel, we trained a suite of classical machine learning models using AutoGluon, covering both CPU- and GPU-based learners with automated model selection and ensembling (https://github.com/autogluon/autogluon). These models were trained with an extensive set of classical molecular representations generated using scikit-fingerprints (https://github.com/scikit-fingerprints/scikit-fingerprints).
+
+Beyond standard supervised training on the provided datasets, several additional steps were applied for some endpoints:
+
+Pretraining on selected external datasets augmented with internal proprietary data, with task-specific weighting applied to relevant endpoints.
+Automated model optimisation via Ray Tune (deep learning) and AutoGluon (classical models).
+Model evaluation using both 5×5 cross-validation with multiple random seeds to ensure robustness and time-based holdout splits on the training set.
+Once a model is stable, we retrained the models on the entire provided training data.
+Following evaluation, the best-performing classical and deep learning models were aggregated into an ensemble, inspired by prior work on heterogeneous model aggregation https://arxiv.org/pdf/2006.08573
+
+Performance comments
+Some endpoints benefited from the integration of external datasets and multi-task training, leading to substantial performance gains. For certain endpoints, cross-validation scores were poorly correlated with held-out performance and exhibited higher variance.
+
+---
+
+OpenADME submission
+Summary:
+We trained various multi-task d-mpnn's (chemprop) models on a collection of public datasets. Initially the approach was based on one go, ensembles of large multi-task models, but a pretraining/fine-tuning approach demonstrated better performance.
+Datasets (public data only) that were used for pre-training included (but were not limited to) the data from the full dataset Polaris challenges [1], Novartis [2], and additional datasets [3, 4]. Additionally, calculated properties were added:
+TPSA (rdkit)
+ESOL [5] (for the competition data only), ESOL values were calculated for all compounds in the ExpansionRx dataset, including the blinded test set and used as an auxiliary task during fine-tuning when ESOL values correlated with the challenge tasks.
+MD derived properties, molecular dynamics simulations were performed in different solvents to derive different properties of interest (e.g. PSA) for the ExpansionRx dataset.
+The final set of models were trained on 108 public ADME tasks filtered by compound overlap (min 50 shared compounds). All training data and models will be made available at a later date.
+Target transformations: log10 for clearance/permeability endpoints; logit transform (log10(x/(100-x))) for protein binding percentages or fractions (only for pretrained data); LogD/LogS already on log scale.
+Held-out set creation strategy: Difficulty-biased splitting using Nearest Neighbor Jaccard distances on Morgan fingerprints - held-out sets enriched with compounds farther from training distribution.
+Based on these splits/datasets, the final submission was created in the following way:
+Chemprop v2.2.1 was used to train models. Next to the hyperparameter optimization, a custom L1-uncertainty based loss function was used. [6]
+Pretrained models were created based on 108 public ADME datasets (~450k data points).
+Task affinity grouping based on Spearman correlation values of the challenge tasks:
+Example grouping for the majority of models (grouping was also optimized):
+- Cluster A: LogD, LogS, MPPB, MBPB, MGMB (solubility/protein binding)
+- Cluster B: LogD, HLM CLint, MLM CLint (metabolism)
+
+---
+
+Description of the Model
+Model Architecture
+Our approach is a hybrid model that integrates 3 molecular representations:
+Uni-Mol2 (Transformer, https://openreview.net/forum?id=64V40K2fDv&noteId=J41KhtPFiO)
+PAMNet (GNN, https://www.nature.com/articles/s41598-023-46382-8)
+Molecular fingerprints (MACCS, ErG, and PubChem)
+
+
+We initialize the Uni-Mol2 encoder with publicly available pre-trained checkpoints. During fine-tuning, all model parameters (Uni-Mol2, PAMNet, and the fingerprint branch) are updated end-to-end.
+Training Data
+We fine-tune our models only on the official training dataset released by the organizers: https://huggingface.co/datasets/openadmet/openadmet-expansionrx-challenge-train-data
+
+We do not use external/private datasets or perform any additional pre-training. Our only pre-trained component is the publicly released Uni-Mol2 checkpoint, which was pre-trained solely on molecular structural information and does not use any property labels or ADMET data.
+Training Strategy
+Preprocessing. We follow the data preprocessing pipeline provided in the organizer’s tutorial, without additional steps.
+Splitting. We use a 5-fold scaffold split.
+Target-specific modeling. We train separate models (and, when appropriate, different input target groups) for different endpoints to better match task-specific characteristics:
+
+
+Target
+Training data
+LogD
+LogD
+KSOL
+LogD, KSOL, MLM, HLM, Efflux, Papp
+MLM
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB, MBPB, MGMB
+HLM
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB
+Efflux
+LogD, KSOL, Efflux, Papp
+Papp
+LogD, KSOL, Efflux, Papp
+MPPB
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB
+MBPB
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB, MBPB, MGMB
+MGMB
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB, MBPB, MGMB
+
+
+Model selection. We select the final configuration based on performance on the public leaderboard, using it to choose the best-performing model variants.
+Performance comments
+Adding the fingerprint branch yields a notable improvement for Efflux and Papp. For other endpoints, fingerprints provide limited gains; however, the Uni-Mol2 + PAMNet backbone already achieves performance comparable to our final submissions.
+
+Unsuccessful Attempts:
+We explored several alternatives that did not lead to improvements, including:
+Descriptor-based machine learning baselines and some features from commercial software packages.
+Adding GAFF2 atom types as an additional descriptor.
+Imbalance-aware training via Label Distribution Smoothing (LDS) to mitigate long-tailed label distributions: LDS weights were computed per endpoint after preprocessing (inverse to a smoothed label-density estimate) and applied during loss computation.
+
+---
+
+Methodology Report
+My approach is similar to my submission to the ASAP-Polaris-OpenADMET Challenge described in our recent publication
+
+Deep Learning vs Classical Methods in Potency and ADME Prediction: Insights from a Computational Blind Challenge.
+J. Chem. Inf. Model. 2025, 65 (24), 13115–13131.
+
+JCIM Article
+ChemRxiv Preprint
+Algorithms: weighted average ensemble of multiple models without hyperparameter tuning
+
+Message passing neural network (MPNN) as implemented in ChemProp 2.2
+Transformer pretrained on tabular data as implemented in TabPFN v2
+Classical tree based models: Random Forest, LightGBM, XGBoost
+Additional Molecular Features
+
+Structural fingerprints: ECFP4, FCFP4, Avalon
+Physchem descriptors: RDKit-2d, Mordred, ADMET-AI predictions
+Learned embeddings: CheMeleon, MiniMol, CLAMP
+Additional Data
+
+Only publicly available data were leveraged.
+Performance comments
+
+My internal cross-validation metrics are comparable to the live leaderboard scores, notably for LogD.
+The endpoints MPPB, MBPB, and MGMB have more variability between internal and LB scores.
+
+---
+
+Methodology Report
+I participated alongside 'rced_nvx' [https://github.com/cedenoruel/OpenADMET-ExpansionRx-Blind-Challenge/blob/main/README.md] and therefore performed overlapping pre-processing techniques. The overall approach is similar to 'rced_nvx's submission to the ASAP-Polaris-OpenADMET Challenge described in our recent publication:
+
+Deep Learning vs Classical Methods in Potency and ADME Prediction: Insights from a Computational Blind Challenge.
+J. Chem. Inf. Model. 2025, 65 (24), 13115–13131.
+
+JCIM Article
+ChemRxiv Preprint
+In brief, initial results were obtained though preliminary data analysis and pre-processing, followed by performance comparison of Classical ML (RF, XGB, LightGBM) vs Deep Learning (ChemProp v2 MPNN, TabPFN v2) techniques.
+
+Intermediate results were obtained through task-specific feature engineering (see below) and refactoring of top-performing Therapeutics Data Commons (ADMET Group) submissions [https://tdcommons.ai/benchmark/admet_group/overview/]. Notably, we refactored the code from MapLight-TDC [https://github.com/maplightrx/MapLight-TDC?tab=readme-ov-file] and CaliciBoost [https://github.com/Calici/CaliciBoost/tree/main].
+
+Structural fingerprints: ECFP4, FCFP4, Avalon
+Physchem descriptors: RDKit-2d, Mordred, ADMET-AI predictions
+Learned embeddings: CheMeleon, MiniMol, CLAMP
+Data augmentation was attempted with C-MixUp (https://arxiv.org/abs/2210.05775) and RIGR (https://chemrxiv.org/engage/chemrxiv/article-details/68d35179f4163037700edd38).
+
+Final results were obtained through weighted averable ensembling of our intermediate submissions.
+
+Data Availability
+We only leveraged the data provided for the challenge, as well as our curation of publicly available data. No proprietary data was used.
+
+Performance Comments
+My most significant performance boost was observed after performing data augmentation with RIGR. This technique allowed to almost triple the size of the training set by enumerating all possible resonance forms of the training set's molecules.
+Surprisingly, without extensive hyperparameter optimization or feature selection, the refactored top-performing TDC submissions did not generalize well to this challenge.
+
+---
+
+Description of the Model
+Algorithm: ChemProp version 2
+
+Parameters: Ensemble of different parameters across ensembles and across endpoints with Bounded-MSE loss, MVE estimators for raw (bounded) data but sometimes delimited data removed on a per endpoint basis
+
+Data: Only the data provided for the challenge and curated publicly available data were utilised. No proprietary data was used.
+
+Additional Steps
+·       All endpoint predictions consist of an ensemble from multiple different ChemProp approaches – no one model or approach was used per-task. Weighted averaging was applied during the ensembling to certain endpoints.
+
+·       Reuse of pre-existing representations: Prior weights are used from ChemMeleon, published work, and our pre-existing in-house ADMET multi-task model trained on large scale ADMET tasks from curated public data sources
+
+·       Multitask pretraining on bespoke de novo chemical space: Pretraining was also performed millions of de novo generated molecules produced by a bespoke pipeline: bivalent ExpansionRx molecules were explicitly identified, cut, and the payload/linker fragments combinatorially enumerated; REINVENT was trained via reinforcement learning separately on competition small molecules and the enumerated bivalents; large-scale filtering and cleaning retained only chemically sensible structures. The generative process was intentionally constrained to chemistry relevant to the competition, while avoiding model collapse or drift into irrelevant regions of chemical space. This curated yet diverse corpus of 10M compounds allowed representation learning of the competition space, yielding a starting representation that may generalise better than foundational Chemprop pretraining on random samples (e.g. CheMeleon) or narrow datasets
+
+·       Explicit task-level masking during pretraining: For each de novo training batch, a fixed-size random subset of Mordred descriptor and calculated physicochemical property tasks is selected, and all other targets are masked out (set to NaN and excluded from the loss). This is analogous to masked-objective training in large multitask language models, but applied here to Chemprop-style molecular graphs: the same molecular graphs are exposed across the many batches while different task subsets are revealed each time, preventing the network from overfitting to correlated descriptor blocks (e.g. Mordred families) and encouraging the MPNN to learn task-agnostic chemical features
+
+·       Training stabilisation via staged freezing: A staged freezing strategy was applied to the subsequent adaptation to the competition dataset. In early training phases, the message-passing architecture (MPNN and associated batch-normalisation layers) was frozen while only the prediction head was optimised. After this warm-up phase, the trunk was unfrozen and jointly fine-tuned with the head, enabling graph representations to adapt to target tasks while avoiding early optimisation instability during transition from foundation to competition-specific training
+
+·       Downweighting of auxiliary training tasks: Although ExpansionRx tasks may be trained jointly via multi-task learning, optimisation was performed explicitly per-task: the task(s) of primary interest were given higher loss weights, while auxiliary tasks were down-weighted (on a per-endpoint basis). This allowed auxiliary signals to shape learned representations without overwhelming or diluting the task of intent, ensuring shared features beneficial to the main endpoint dominated learned embeddings
+
+·       Auxiliary (side information) data options: Auxiliary data were incorporated to competition-specific training via two frameworks:
+
+o      (i) as additional input features appended to the descriptor matrix, or
+
+o      (ii) as auxiliary prediction targets appended to the label matrix
+
+After incorporation in (ii), task affinity grouping (TAG) was implemented via a meta-learning procedure. In initial exploration, task combinations were evaluated whether joint optimisation improved primary task of intent loss and used to infer affinity groups. Only tasks within the affinity group were trained jointly, ensuring representations were learnt from chemically and biologically compatible tasks, reducing negative transfer from unrelated endpoints. We observed improvements appending selected in-house ADMET multi-task bioactivity matrices derived from curated public data sources (without overlap to the competition data), as well as predictions from a public predictive head (https://pubs.acs.org/doi/full/10.1021/acsomega.5c04861
+
+) to the label matrix.
+
+·              Additional featurization: Mordred, Jazzy and curated RDKit descriptors feature sets related to RNA binding were evaluated and applied on a TAG group basis
+
+·       De-noising applied to training data: Denoising of the training data was performed once there were sufficiently supported predictions on the training set, as in: https://chemrxiv.org/engage/chemrxiv/article-details/661cd020418a5379b0df1fda
+
+·       Reconciled public data into training: Public data for HLM and MLM CLint endpoints were reconciled into the ExpansionRx tasks for some ensemble members
+
+·       Method agnostic ensembling: Multiple variants of the above configurations (different masking schemes, auxiliary feature/label combinations, and task weightings) were trained, and ensembles constructed per-endpoint, rather than relying on a single fixed pretraining recipe
+
+·       Stabilised learning: To stabilise optimisation, some networks were trained deliberately slowly via extended learning-rate warmup schedules (10–30 epochs depending on the task). Conservative initial, max and final learning rates and relatively strong weight decay on the predictor head were utilised while keeping lighter trunk regularisation (dropout applied primarily within the FFN). Our aim was to encourage incremental adaptation of the learned molecular representations, allowing signal to accumulate across epochs while suppressing sensitivity to batch-level noise and spurious correlations.
+
+Observed Performance During Training
+Bivalent molecules were treated as a distinct and highly variant chemical class, exhibiting substantially greater structural diversity and conformational flexibility than typical small molecules, with correspondingly high variance in model predictions and performance during training. Their controlled fragmentation and explicit enumeration during foundational pre-training were considered critical to prevent representation collapse toward the dominant small-molecule chemical space, which may be less represented in the final leaderboard test set. During representation learning, particular care was taken with inherently noisy experimental endpoints, which were reflected in volatile leaderboard performance that changed rapidly across submissions and exhibited behaviour consistent with substantial label and evaluation noise. The masked multi-task objective, task subsampling, auxiliary-task regularisation, slowed training, and staged unfreezing of the trunk were collectively used to regularise learning, encouraging robust and transferable representations vs. memorisation of assay noise during training.
+
+In addition, some ensemble members were selected not on lowest validation MAE, but on clearly higher R² performance. This choice was made to favour models capturing stronger explanatory structure, with the potential that this would translate into improved generalisation and superior performance on the final leaderboard.
+
+---
+
+Methodology Report
+GitHub: https://github.com/MalteGrieswelle/OpenADMET-ExpansionRX?tab=readme-ov-file
+Description of the Model
+A Chemprop MPNN with multi-head predictions was chosen as the architecture.
+
+Public datasets were also included. Basic dataset sanitization was performed and included the removal of duplicates, metals, salt. Other newly introduced endpoints were predicted separately (except HLM Clint).
+
+The labels were log-transformed and scaled. An ensemble of 25 models was used, each trained with one prediction head per endpoint. For each endpoint, the model with the lowest validation MAE of the stratified k-fold (90/10) was saved. The final prediction was generated from the saved best model heads, and a weighted average (based on best validation MAE) was used for submission.
+Performance comments
+Chemprop models outperform a custom GNN implementation. The custom overfitted single model outperformed an ensemble of custom GNNs on the intermediate leaderboard. Combining data into one endpoint or removal of outlier/ activity cliffs (Tanimoto Similarity >0.8, SALI >3.0) worsens performance.
