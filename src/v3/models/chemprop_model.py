@@ -42,6 +42,61 @@ def _check_chemprop():
         )
 
 
+def _resolve_chemprop_api():
+    """Locate Chemprop's API objects across v2.0–v2.x naming changes.
+
+    Returns a dict of resolved classes/functions; raises with a clear
+    message if any required piece is missing.
+    """
+    import importlib
+    found = {}
+    # Featurizer moved between chemprop.data and chemprop.featurizers
+    for candidate in (
+        ("chemprop.featurizers",          "SimpleMoleculeMolGraphFeaturizer"),
+        ("chemprop.featurizers.molgraph", "SimpleMoleculeMolGraphFeaturizer"),
+        ("chemprop.data",                 "SimpleMoleculeMolGraphFeaturizer"),
+    ):
+        mod_name, attr = candidate
+        try:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, attr):
+                found["Featurizer"] = getattr(mod, attr)
+                break
+        except ImportError:
+            continue
+    if "Featurizer" not in found:
+        raise SystemExit(
+            "Could not locate SimpleMoleculeMolGraphFeaturizer in chemprop. "
+            "Tried: chemprop.featurizers, chemprop.featurizers.molgraph, "
+            "chemprop.data. Run `pip show chemprop` and tell me the "
+            "version so I can fix the wrapper."
+        )
+
+    # MoleculeDatapoint / Dataset / collate_batch — historically all in chemprop.data
+    from chemprop import data as _data
+    for attr in ("MoleculeDatapoint", "MoleculeDataset", "collate_batch"):
+        if not hasattr(_data, attr):
+            raise SystemExit(
+                f"chemprop.data is missing {attr!r} -- API change.")
+        found[attr] = getattr(_data, attr)
+
+    # BondMessagePassing etc. live under chemprop.nn
+    from chemprop import nn as _nn, models as _models
+    for attr in ("BondMessagePassing", "MeanAggregation",
+                 "RegressionFFN", "UnscaleTransform"):
+        if not hasattr(_nn, attr):
+            raise SystemExit(f"chemprop.nn is missing {attr!r} -- API change.")
+        found[attr] = getattr(_nn, attr)
+    found["MPNN"] = _models.MPNN
+
+    try:
+        from chemprop.nn.metrics import MAE as _MAE
+    except ImportError:
+        raise SystemExit("Could not import chemprop.nn.metrics.MAE")
+    found["MAE"] = _MAE
+    return found
+
+
 def _build_multitask_csv(train_df: pd.DataFrame, endpoints: List[str],
                          out_path: Path) -> List[str]:
     """Write a Chemprop-friendly CSV: smiles + N target columns (NaN ok)."""
@@ -65,10 +120,20 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     """
     _check_chemprop()
     import torch
-    from chemprop import data, models, nn
-    from chemprop.nn.metrics import MAE
     from lightning import pytorch as pl
     from torch.utils.data import DataLoader
+
+    api = _resolve_chemprop_api()
+    Featurizer       = api["Featurizer"]
+    MoleculeDatapoint = api["MoleculeDatapoint"]
+    MoleculeDataset   = api["MoleculeDataset"]
+    collate_batch     = api["collate_batch"]
+    BondMessagePassing = api["BondMessagePassing"]
+    MeanAggregation    = api["MeanAggregation"]
+    RegressionFFN      = api["RegressionFFN"]
+    UnscaleTransform   = api["UnscaleTransform"]
+    MPNN               = api["MPNN"]
+    MAE                = api["MAE"]
 
     epochs = epochs or CHEMPROP_PARAMS["epochs"]
     work_dir = V3_OUT / "chemprop" / f"{cluster_name}_seed{seed}"
@@ -88,7 +153,7 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
         y = log_transform_endpoint(train_df[endpoints[j]], log_scale, mult, zh)
         targets[:, j] = y.to_numpy()
 
-    train_data = [data.MoleculeDatapoint.from_smi(s, y) for s, y in zip(smis, targets)]
+    train_data = [MoleculeDatapoint.from_smi(s, y) for s, y in zip(smis, targets)]
     # Random 90/10 split for early stopping
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(train_data))
@@ -97,30 +162,31 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     tr = [d for i, d in enumerate(train_data) if i not in val_idx]
     va = [d for i, d in enumerate(train_data) if i in val_idx]
 
-    test_data = [data.MoleculeDatapoint.from_smi(s, np.zeros(len(short_cols), dtype=np.float32))
+    test_data = [MoleculeDatapoint.from_smi(s, np.zeros(len(short_cols), dtype=np.float32))
                  for s in test_smis]
 
-    featurizer = data.SimpleMoleculeMolGraphFeaturizer()
-    train_dset = data.MoleculeDataset(tr, featurizer)
-    val_dset = data.MoleculeDataset(va, featurizer)
-    test_dset = data.MoleculeDataset(test_data, featurizer)
+    featurizer = Featurizer()
+    train_dset = MoleculeDataset(tr, featurizer)
+    val_dset   = MoleculeDataset(va, featurizer)
+    test_dset  = MoleculeDataset(test_data, featurizer)
 
     bs = CHEMPROP_PARAMS["batch_size"]
     train_loader = DataLoader(train_dset, batch_size=bs, shuffle=True,
-                              num_workers=2, collate_fn=data.collate_batch)
+                              num_workers=2, collate_fn=collate_batch)
     val_loader = DataLoader(val_dset, batch_size=bs, shuffle=False,
-                            num_workers=2, collate_fn=data.collate_batch)
+                            num_workers=2, collate_fn=collate_batch)
     test_loader = DataLoader(test_dset, batch_size=bs, shuffle=False,
-                             num_workers=2, collate_fn=data.collate_batch)
+                             num_workers=2, collate_fn=collate_batch)
 
     # ---- Model -------------------------------------------------------------
-    mp = nn.BondMessagePassing(depth=CHEMPROP_PARAMS["depth"],
-                               d_h=CHEMPROP_PARAMS["hidden_size"],
-                               dropout=CHEMPROP_PARAMS["dropout"])
-    agg = nn.MeanAggregation()
-    ffn = nn.RegressionFFN(n_tasks=len(short_cols), output_transform=nn.UnscaleTransform(0.0, 1.0))
+    mp = BondMessagePassing(depth=CHEMPROP_PARAMS["depth"],
+                            d_h=CHEMPROP_PARAMS["hidden_size"],
+                            dropout=CHEMPROP_PARAMS["dropout"])
+    agg = MeanAggregation()
+    ffn = RegressionFFN(n_tasks=len(short_cols),
+                        output_transform=UnscaleTransform(0.0, 1.0))
     metric_list = [MAE()]
-    model = models.MPNN(mp, agg, ffn, batch_norm=True, metrics=metric_list)
+    model = MPNN(mp, agg, ffn, batch_norm=True, metrics=metric_list)
 
     pl.seed_everything(seed)
     trainer = pl.Trainer(
