@@ -150,18 +150,39 @@ def train_tabpfn(train_df, test_df, X_full_train, X_full_test, args):
 def train_chemprop(train_df, test_df, args):
     if args.skip_chemprop:
         return
+
+    # ---- Resume check: if every endpoint already has a chemprop test cache,
+    #      skip retraining; just (re-)compute val predictions from the saved
+    #      checkpoints so the ensemble can weight Chemprop properly.
+    short_names = [cfg.ENDPOINT_PREP[a][2] for a in cfg.SUBMISSION_COLUMNS]
+    all_test_cached = all(
+        _load_pred("chemprop", s, "test") is not None for s in short_names)
+    any_val_missing = any(
+        _load_pred("chemprop", s, "val") is None for s in short_names)
+
+    if args.resume and all_test_cached and not any_val_missing:
+        print("  Chemprop: all test+val preds cached, skipping")
+        return
+    if args.resume and all_test_cached and any_val_missing:
+        print("  Chemprop: test preds cached but val missing; "
+              "backfilling from saved checkpoints (no retrain)")
+        from .backfill_chemprop_val import main as _backfill
+        _backfill()
+        return
+
     from .models.chemprop_model import train_all_clusters
     print("  Chemprop: training every TASK_GROUPS cluster + ensemble-of-seeds")
-    averaged = train_all_clusters(train_df, test_df,
-                                  seeds=list(range(cfg.CHEMPROP_PARAMS["ensemble_size"])))
-    # ``averaged`` is keyed by short_name, value = log-space test predictions
+    averaged = train_all_clusters(
+        train_df, test_df,
+        seeds=list(range(cfg.CHEMPROP_PARAMS["ensemble_size"])))
+    # averaged is keyed by short_name -> log-space test predictions
     for short, vals in averaged.items():
         _save_pred("chemprop", short, "test", vals)
-        # Time-window val predictions: produced internally by the cluster
-        # trainer for early stopping; we don't expose them, so drop the
-        # learner from the per-endpoint ensemble fit if needed (simpler to
-        # generate via a held-out time-window run later if you want to
-        # weight Chemprop precisely).
+
+    # Now backfill val predictions from the freshly-saved checkpoints
+    print("  Chemprop: training done; backfilling time-window val preds")
+    from .backfill_chemprop_val import main as _backfill
+    _backfill()
 
 
 def fit_per_endpoint_ensemble(train_df, test_df):
