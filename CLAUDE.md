@@ -205,7 +205,26 @@ Overwriting works fine (`open(p, "wb")`). On the T4 host this won't be a
 problem; mentioning it only if you see weird "operation not permitted"
 errors.
 
-### 3.6 RDKit "DEPRECATION WARNING: please use MorganGenerator"
+### 3.6 Chemprop time-window val leakage (FIXED)
+
+The first chemprop integration trained on the FULL ``train.csv`` (5326 mols)
+with its own random 90/10 internal val split. The ensemble layer then asked
+for predictions on the time-window val set (800 mols), but those 800 mols
+were already in chemprop's training pool — so chemprop's "val" predictions
+were near-perfect, the NNLS optimizer gave it weight 1.00 everywhere, and
+the ensemble effectively reduced to "chemprop alone" (which actually scored
+0.707 — chemprop is genuinely strong, but we lost the diversity benefit of
+combining it with classical/TabPFN).
+
+The fix: ``train_all_clusters`` now takes ``train_indices`` and
+``val_indices``. ``run.py:train_chemprop`` passes the time-window train/val
+indices, so chemprop trains on tr_idx (3728 mols), holds out va_idx (800
+mols) entirely, and produces leak-free val predictions for the ensemble.
+
+If you ever revert this and start using the full train_df again, expect
+chemprop to dominate every endpoint's NNLS weights with weight 1.0.
+
+### 3.7 RDKit "DEPRECATION WARNING: please use MorganGenerator"
 
 Newer RDKit (≥ 2024.03) prints this once **per molecule** when you call
 ``AllChem.GetMorganFingerprintAsBitVect``. With 5326 train + 2282 test

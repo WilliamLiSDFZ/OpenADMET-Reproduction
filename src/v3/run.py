@@ -151,38 +151,40 @@ def train_chemprop(train_df, test_df, args):
     if args.skip_chemprop:
         return
 
-    # ---- Resume check: if every endpoint already has a chemprop test cache,
-    #      skip retraining; just (re-)compute val predictions from the saved
-    #      checkpoints so the ensemble can weight Chemprop properly.
     short_names = [cfg.ENDPOINT_PREP[a][2] for a in cfg.SUBMISSION_COLUMNS]
     all_test_cached = all(
         _load_pred("chemprop", s, "test") is not None for s in short_names)
-    any_val_missing = any(
-        _load_pred("chemprop", s, "val") is None for s in short_names)
+    all_val_cached = all(
+        _load_pred("chemprop", s, "val") is not None for s in short_names)
 
-    if args.resume and all_test_cached and not any_val_missing:
+    if args.resume and all_test_cached and all_val_cached:
         print("  Chemprop: all test+val preds cached, skipping")
         return
-    if args.resume and all_test_cached and any_val_missing:
-        print("  Chemprop: test preds cached but val missing; "
-              "backfilling from saved checkpoints (no retrain)")
-        from .backfill_chemprop_val import main as _backfill
-        _backfill()
-        return
+
+    # Time-window train/val split — chemprop must train ONLY on tr_idx so that
+    # its predictions on va_idx are leak-free for ensemble weighting.
+    tr_idx, va_idx, _ = time_window_split(
+        train_df["Molecule Name"].tolist(), train_pct=0.7, val_pct=0.15)
 
     from .models.chemprop_model import train_all_clusters
-    print("  Chemprop: training every TASK_GROUPS cluster + ensemble-of-seeds")
+    print(f"  Chemprop: training on {len(tr_idx)} time-window-train molecules, "
+          f"holding out {len(va_idx)} for ensemble weighting")
     averaged = train_all_clusters(
         train_df, test_df,
-        seeds=list(range(cfg.CHEMPROP_PARAMS["ensemble_size"])))
-    # averaged is keyed by short_name -> log-space test predictions
-    for short, vals in averaged.items():
-        _save_pred("chemprop", short, "test", vals)
-
-    # Now backfill val predictions from the freshly-saved checkpoints
-    print("  Chemprop: training done; backfilling time-window val preds")
-    from .backfill_chemprop_val import main as _backfill
-    _backfill()
+        seeds=list(range(cfg.CHEMPROP_PARAMS["ensemble_size"])),
+        train_indices=tr_idx,
+        val_indices=va_idx,
+    )
+    # averaged is keyed "<short>__test" / "<short>__val"
+    for key, vals in averaged.items():
+        if key.endswith("__test"):
+            short = key[: -len("__test")]
+            _save_pred("chemprop", short, "test", vals)
+        elif key.endswith("__val"):
+            short = key[: -len("__val")]
+            # The ensemble layer expects val pred arrays of length len(va_idx);
+            # our chemprop val preds are already that length and aligned to va_idx.
+            _save_pred("chemprop", short, "val", vals)
 
 
 def fit_per_endpoint_ensemble(train_df, test_df):

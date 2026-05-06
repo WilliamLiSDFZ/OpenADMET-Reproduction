@@ -111,11 +111,25 @@ def _build_multitask_csv(train_df: pd.DataFrame, endpoints: List[str],
 def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
                     cluster_name: str, endpoints: List[str],
                     seed: int = RANDOM_STATE,
-                    epochs: int | None = None) -> Dict[str, np.ndarray]:
+                    epochs: int | None = None,
+                    train_indices=None,
+                    val_indices=None,
+                    ) -> Dict[str, np.ndarray]:
     """Train one multi-task Chemprop model on the given endpoint cluster.
 
-    Returns a dict ``{short_name: predictions_on_test}`` already in log
-    space. The caller inverse-log-transforms via ``data.inverse_log_endpoint``.
+    If ``train_indices`` is given, fits ONLY on those rows of ``train_df``
+    (this is what we want to keep the time-window val truly held out — the
+    earlier "train on everything then predict val" path leaked because every
+    val molecule was already in chemprop's train set).
+
+    If ``val_indices`` is given, also returns predictions on those rows so
+    the per-endpoint NNLS ensemble can weight chemprop fairly.
+
+    Returns a dict with two-level keys:
+        ``"<short>__test"`` -> 1-D array of length len(test_df)
+        ``"<short>__val"``  -> 1-D array of length len(val_indices)  (only when
+                               val_indices is provided)
+    Predictions are in the same log space as the targets.
     """
     _check_chemprop()
     import torch
@@ -145,32 +159,49 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     short_cols = _build_multitask_csv(train_df, endpoints, train_csv)
 
     # ---- Build Chemprop dataset --------------------------------------------
-    smis = train_df["SMILES"].tolist()
+    # Restrict the training pool to the requested indices so the time-window
+    # val rows are held out (no leakage into the ensemble-weight learning).
+    if train_indices is not None:
+        train_pool = train_df.iloc[train_indices].reset_index(drop=True)
+    else:
+        train_pool = train_df
+
+    smis = train_pool["SMILES"].tolist()
     test_smis = test_df["SMILES"].tolist()
 
     targets = np.full((len(smis), len(short_cols)), np.nan, dtype=np.float32)
     for j, c in enumerate(short_cols):
-        # log-space y, with NaN preserved
         log_scale, mult, _, zh = ENDPOINT_PREP[endpoints[j]]
-        y = log_transform_endpoint(train_df[endpoints[j]], log_scale, mult, zh)
+        y = log_transform_endpoint(train_pool[endpoints[j]], log_scale, mult, zh)
         targets[:, j] = y.to_numpy()
 
     train_data = [MoleculeDatapoint.from_smi(s, y) for s, y in zip(smis, targets)]
-    # Random 90/10 split for early stopping
+    # Random 90/10 split of the training pool, JUST for early stopping. This
+    # internal split is contained inside the time-window train fold, so the
+    # external time-window val (val_indices) is never seen by the model.
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(train_data))
-    n_val = max(1, len(train_data) // 10)
-    val_idx = set(perm[:n_val].tolist())
-    tr = [d for i, d in enumerate(train_data) if i not in val_idx]
-    va = [d for i, d in enumerate(train_data) if i in val_idx]
+    n_internal_val = max(1, len(train_data) // 10)
+    internal_val = set(perm[:n_internal_val].tolist())
+    tr = [d for i, d in enumerate(train_data) if i not in internal_val]
+    va = [d for i, d in enumerate(train_data) if i in internal_val]
 
     test_data = [MoleculeDatapoint.from_smi(s, np.zeros(len(short_cols), dtype=np.float32))
                  for s in test_smis]
 
+    # Time-window val SMILES (held out from training): predicted at the end so
+    # the ensemble layer can weight chemprop on leak-free predictions.
+    holdout_smis = []
+    if val_indices is not None:
+        holdout_smis = train_df["SMILES"].iloc[val_indices].tolist()
+    holdout_data = [MoleculeDatapoint.from_smi(s, np.zeros(len(short_cols), dtype=np.float32))
+                    for s in holdout_smis]
+
     featurizer = Featurizer()
-    train_dset = MoleculeDataset(tr, featurizer)
-    val_dset   = MoleculeDataset(va, featurizer)
-    test_dset  = MoleculeDataset(test_data, featurizer)
+    train_dset   = MoleculeDataset(tr, featurizer)
+    val_dset     = MoleculeDataset(va, featurizer)
+    test_dset    = MoleculeDataset(test_data, featurizer)
+    holdout_dset = MoleculeDataset(holdout_data, featurizer) if holdout_smis else None
 
     bs = CHEMPROP_PARAMS["batch_size"]
     train_loader = DataLoader(train_dset, batch_size=bs, shuffle=True,
@@ -179,6 +210,9 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
                             num_workers=2, collate_fn=collate_batch)
     test_loader = DataLoader(test_dset, batch_size=bs, shuffle=False,
                              num_workers=2, collate_fn=collate_batch)
+    holdout_loader = (DataLoader(holdout_dset, batch_size=bs, shuffle=False,
+                                  num_workers=2, collate_fn=collate_batch)
+                      if holdout_dset is not None else None)
 
     # ---- Model -------------------------------------------------------------
     mp = BondMessagePassing(depth=CHEMPROP_PARAMS["depth"],
@@ -207,25 +241,48 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     preds_per_batch = trainer.predict(model, test_loader)
     test_preds = torch.cat(preds_per_batch).cpu().numpy()  # (n_test, n_tasks)
 
-    out = {short_cols[j]: test_preds[:, j] for j in range(len(short_cols))}
+    out: Dict[str, np.ndarray] = {}
+    for j, sc in enumerate(short_cols):
+        out[f"{sc}__test"] = test_preds[:, j]
+
+    # ---- (Optional) Predict on the held-out time-window val ----------------
+    if holdout_loader is not None:
+        holdout_per_batch = trainer.predict(model, holdout_loader)
+        holdout_preds = torch.cat(holdout_per_batch).cpu().numpy()  # (n_val, n_tasks)
+        for j, sc in enumerate(short_cols):
+            out[f"{sc}__val"] = holdout_preds[:, j]
+
     np.savez_compressed(work_dir / "predictions.npz", **out,
-                        smiles=np.array(test_smis), columns=np.array(short_cols))
+                        test_smiles=np.array(test_smis),
+                        val_smiles=np.array(holdout_smis),
+                        columns=np.array(short_cols))
     print(f"  Wrote {work_dir/'predictions.npz'}")
     return out
 
 
 def train_all_clusters(train_df: pd.DataFrame, test_df: pd.DataFrame,
-                       seeds: List[int] | None = None) -> Dict[str, np.ndarray]:
-    """Train every TASK_GROUPS cluster with a small ensemble, average per endpoint.
+                       seeds: List[int] | None = None,
+                       train_indices=None,
+                       val_indices=None,
+                       ) -> Dict[str, np.ndarray]:
+    """Train every TASK_GROUPS cluster, ensembled across seeds. Returns
 
-    Returns ``{short_name: averaged_log_predictions_on_test}``.
+        {"<short>__test": averaged_log_test_preds,
+         "<short>__val":  averaged_log_val_preds   (only if val_indices given)}
+
+    Pass ``train_indices`` (and ``val_indices``) to keep an external held-out
+    set leak-free for ensemble weight learning. Without those, training uses
+    the full train_df (legacy behaviour, kept for backward compat).
     """
     seeds = seeds or list(range(CHEMPROP_PARAMS["ensemble_size"]))
     accumulator: Dict[str, List[np.ndarray]] = {}
     for cluster_name, endpoints in TASK_GROUPS.items():
         for seed in seeds:
             print(f"== Chemprop  cluster={cluster_name}  seed={seed} ==")
-            preds = train_multitask(train_df, test_df, cluster_name, endpoints, seed=seed)
+            preds = train_multitask(
+                train_df, test_df, cluster_name, endpoints, seed=seed,
+                train_indices=train_indices, val_indices=val_indices,
+            )
             for k, v in preds.items():
                 accumulator.setdefault(k, []).append(v)
 
