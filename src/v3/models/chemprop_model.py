@@ -82,8 +82,7 @@ def _resolve_chemprop_api():
 
     # BondMessagePassing etc. live under chemprop.nn
     from chemprop import nn as _nn, models as _models
-    for attr in ("BondMessagePassing", "MeanAggregation",
-                 "RegressionFFN", "UnscaleTransform"):
+    for attr in ("BondMessagePassing", "MeanAggregation", "RegressionFFN"):
         if not hasattr(_nn, attr):
             raise SystemExit(f"chemprop.nn is missing {attr!r} -- API change.")
         found[attr] = getattr(_nn, attr)
@@ -131,9 +130,12 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     BondMessagePassing = api["BondMessagePassing"]
     MeanAggregation    = api["MeanAggregation"]
     RegressionFFN      = api["RegressionFFN"]
-    UnscaleTransform   = api["UnscaleTransform"]
     MPNN               = api["MPNN"]
     MAE                = api["MAE"]
+    # UnscaleTransform's signature changed across chemprop versions; we
+    # don't actually need to unscale (target values are already in log
+    # space), so we simply omit output_transform and let RegressionFFN
+    # use its identity default.
 
     epochs = epochs or CHEMPROP_PARAMS["epochs"]
     work_dir = V3_OUT / "chemprop" / f"{cluster_name}_seed{seed}"
@@ -183,8 +185,7 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
                             d_h=CHEMPROP_PARAMS["hidden_size"],
                             dropout=CHEMPROP_PARAMS["dropout"])
     agg = MeanAggregation()
-    ffn = RegressionFFN(n_tasks=len(short_cols),
-                        output_transform=UnscaleTransform(0.0, 1.0))
+    ffn = RegressionFFN(n_tasks=len(short_cols))
     metric_list = [MAE()]
     model = MPNN(mp, agg, ffn, batch_norm=True, metrics=metric_list)
 
