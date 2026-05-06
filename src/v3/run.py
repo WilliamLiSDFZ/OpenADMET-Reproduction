@@ -148,6 +148,20 @@ def train_tabpfn(train_df, test_df, X_full_train, X_full_test, args):
 
 
 def train_chemprop(train_df, test_df, args):
+    """Two-pass Chemprop training, mirroring how classical models are trained:
+
+    Pass 1 (val preds, leak-free): train on time-window train (tr_idx) only,
+            predict on time-window val (va_idx) -> save as ``chemprop__*__val``.
+            Used by NNLS to weight Chemprop fairly.
+
+    Pass 2 (test preds, best quality): train on the FULL train.csv,
+            predict on test.csv -> save as ``chemprop__*__test``.
+            More training data = stronger test predictions.
+
+    Each pass is itself a (cluster x seed) ensemble. Pass 1 ckpts overwrite
+    pass 2's because they share work_dir naming, but per-model predictions
+    are persisted separately under per_model_predictions/, so that's fine.
+    """
     if args.skip_chemprop:
         return
 
@@ -161,30 +175,37 @@ def train_chemprop(train_df, test_df, args):
         print("  Chemprop: all test+val preds cached, skipping")
         return
 
-    # Time-window train/val split — chemprop must train ONLY on tr_idx so that
-    # its predictions on va_idx are leak-free for ensemble weighting.
     tr_idx, va_idx, _ = time_window_split(
         train_df["Molecule Name"].tolist(), train_pct=0.7, val_pct=0.15)
+    seeds = list(range(cfg.CHEMPROP_PARAMS["ensemble_size"]))
 
     from .models.chemprop_model import train_all_clusters
-    print(f"  Chemprop: training on {len(tr_idx)} time-window-train molecules, "
-          f"holding out {len(va_idx)} for ensemble weighting")
-    averaged = train_all_clusters(
-        train_df, test_df,
-        seeds=list(range(cfg.CHEMPROP_PARAMS["ensemble_size"])),
-        train_indices=tr_idx,
-        val_indices=va_idx,
-    )
-    # averaged is keyed "<short>__test" / "<short>__val"
-    for key, vals in averaged.items():
-        if key.endswith("__test"):
-            short = key[: -len("__test")]
-            _save_pred("chemprop", short, "test", vals)
-        elif key.endswith("__val"):
-            short = key[: -len("__val")]
-            # The ensemble layer expects val pred arrays of length len(va_idx);
-            # our chemprop val preds are already that length and aligned to va_idx.
-            _save_pred("chemprop", short, "val", vals)
+
+    # ---- Pass 1: leak-free val predictions (train on tr_idx only) ---------
+    if not all_val_cached:
+        print(f"  Chemprop pass 1/2: training on {len(tr_idx)} time-window-train "
+              f"mols, predicting on {len(va_idx)} held-out val")
+        out = train_all_clusters(
+            train_df, test_df,
+            seeds=seeds, train_indices=tr_idx, val_indices=va_idx)
+        for key, vals in out.items():
+            if key.endswith("__val"):
+                short = key[: -len("__val")]
+                _save_pred("chemprop", short, "val", vals)
+
+    # ---- Pass 2: best-quality test predictions (train on full train.csv) --
+    if not all_test_cached:
+        print(f"  Chemprop pass 2/2: training on full {len(train_df)} mols "
+              f"for high-quality test predictions")
+        out = train_all_clusters(
+            train_df, test_df, seeds=seeds,
+            # no train_indices / val_indices -> uses full train.csv,
+            # skips val prediction step
+        )
+        for key, vals in out.items():
+            if key.endswith("__test"):
+                short = key[: -len("__test")]
+                _save_pred("chemprop", short, "test", vals)
 
 
 def fit_per_endpoint_ensemble(train_df, test_df):
