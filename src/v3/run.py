@@ -243,14 +243,31 @@ def fit_per_endpoint_ensemble(train_df, test_df):
     return sub_path
 
 
-def run_official_eval(submission_csv: Path) -> Path:
+def run_official_eval(submission_csv: Path) -> Path | None:
+    """Try the official scorer; if its repo isn't found, point the user at
+    the manual command so the partial run isn't lost."""
     metrics_path = cfg.V3_OUT / "official_eval_v3.csv"
+    if not Path(cfg.EVAL_REPO).is_dir():
+        print(f"\n  WARN: official-eval repo not found at {cfg.EVAL_REPO}.")
+        print("  The submission is already written, just score it manually:")
+        print(f"    cd <your ExpansionRx-Challenge-Eval clone>")
+        print(f"    python -m eval {submission_csv} \\")
+        print(f"        --ground-truth {cfg.GROUND_TRUTH_CSV} \\")
+        print(f"        --output {metrics_path}")
+        print("\n  Or set EVAL_REPO=/path/to/ExpansionRx-Challenge-Eval and re-run.")
+        return None
+
     cmd = [sys.executable, "-m", "eval", str(submission_csv),
            "--ground-truth", str(cfg.GROUND_TRUTH_CSV),
            "--output", str(metrics_path)]
     print("Running official eval ↓")
     print("  $ " + " ".join(cmd))
-    subprocess.run(cmd, cwd=cfg.EVAL_REPO, check=True)
+    try:
+        subprocess.run(cmd, cwd=cfg.EVAL_REPO, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"\n  WARN: eval failed: {e}")
+        print("  Submission file is still at:", submission_csv)
+        return None
     res = pd.read_csv(metrics_path)
     print(res[["Endpoint", "mean_RAE", "mean_R2"]].to_string(index=False))
     macro = res[res["Endpoint"].str.contains("Macro", case=False, na=False)]

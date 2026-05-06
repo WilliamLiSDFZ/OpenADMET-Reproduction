@@ -10,17 +10,28 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
-from rdkit import Chem, DataStructs
+from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Avalon import pyAvalonTools
-from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem import Descriptors, rdFingerprintGenerator
 from rdkit.ML.Descriptors import MoleculeDescriptors
 
 from .config import AVALON_BITS, FP_BITS, FP_RADIUS, V3_OUT
+
+# Silence the per-molecule "DEPRECATION WARNING: please use MorganGenerator"
+# spam that older code paths trigger.
+RDLogger.DisableLog("rdApp.*")
 
 _DESC_NAMES = [d[0] for d in Descriptors.descList]
 _DESC_CALC = MoleculeDescriptors.MolecularDescriptorCalculator(_DESC_NAMES)
 N_RDKIT = len(_DESC_NAMES)
 _MORDRED_CALC = None  # lazy
+
+# Modern Morgan fingerprint generator (replaces the deprecated
+# AllChem.GetMorganFingerprintAsBitVect). Built once at import time;
+# threadsafe in RDKit ≥ 2023.09.
+_MORGAN_GEN = rdFingerprintGenerator.GetMorganGenerator(
+    radius=FP_RADIUS, fpSize=FP_BITS
+)
 
 
 def _mordred():
@@ -53,7 +64,7 @@ def _morgan(mol) -> np.ndarray:
     arr = np.zeros(FP_BITS, dtype=np.uint8)
     if mol is None:
         return arr
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=FP_RADIUS, nBits=FP_BITS)
+    fp = _MORGAN_GEN.GetFingerprint(mol)
     DataStructs.ConvertToNumpyArray(fp, arr)
     return arr
 

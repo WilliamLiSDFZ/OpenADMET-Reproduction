@@ -13,7 +13,36 @@ TEST_CSV = DATA_DIR / "test.csv"
 GROUND_TRUTH_CSV = DATA_DIR / "test_ground_truth.csv"
 
 V3_OUT = ROOT / "output" / "v3"
-EVAL_REPO = Path("/sessions/bold-beautiful-faraday/mnt/python/ExpansionRx-Challenge-Eval")
+
+
+def _resolve_eval_repo() -> Path:
+    """Locate the ExpansionRx-Challenge-Eval repo.
+
+    Resolution order:
+      1. ``EVAL_REPO`` env var (absolute path)
+      2. Sibling directory of the project root  (../ExpansionRx-Challenge-Eval)
+      3. Sibling directory at one level up        (../../ExpansionRx-Challenge-Eval)
+      4. Common dev-machine paths (last-ditch fallback)
+
+    Returns whatever it finds first; falls back to the sibling-of-project
+    path even if it doesn't exist (so the error message is informative).
+    """
+    env = os.environ.get("EVAL_REPO")
+    if env:
+        return Path(env).expanduser().resolve()
+
+    candidates = [
+        ROOT.parent / "ExpansionRx-Challenge-Eval",
+        ROOT.parent.parent / "ExpansionRx-Challenge-Eval",
+        Path("/sessions/bold-beautiful-faraday/mnt/python/ExpansionRx-Challenge-Eval"),
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c.resolve()
+    return candidates[0]   # informative default error if missing
+
+
+EVAL_REPO = _resolve_eval_repo()
 
 # ----- Endpoints ----------------------------------------------------------
 SUBMISSION_COLUMNS = [

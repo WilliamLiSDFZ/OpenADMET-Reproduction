@@ -13,14 +13,18 @@ from __future__ import annotations
 from typing import List, Tuple
 
 import numpy as np
-from rdkit import Chem, DataStructs
+from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Avalon import pyAvalonTools
-from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem import Descriptors, rdFingerprintGenerator
 from rdkit.ML.Descriptors import MoleculeDescriptors
+
+# Silence RDKit "DEPRECATION WARNING: please use MorganGenerator" spam.
+RDLogger.DisableLog("rdApp.*")
 
 # ---- RDKit 2D descriptors (~210 columns) -------------------------------
 _DESC_NAMES: List[str] = [d[0] for d in Descriptors.descList]
 _DESC_CALC = MoleculeDescriptors.MolecularDescriptorCalculator(_DESC_NAMES)
+_MORGAN_GEN_2_2048 = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 # ---- Morgan fingerprint (radius=2, 2048 bits) ---------------------------
 MORGAN_BITS = 2048
@@ -64,7 +68,11 @@ def calc_morgan_fp(mol, n_bits: int = MORGAN_BITS,
                    radius: int = MORGAN_RADIUS) -> np.ndarray:
     if mol is None:
         return np.zeros(n_bits, dtype=np.uint8)
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+    if (radius, n_bits) == (2, 2048):
+        gen = _MORGAN_GEN_2_2048
+    else:
+        gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+    fp = gen.GetFingerprint(mol)
     arr = np.zeros(n_bits, dtype=np.uint8)
     DataStructs.ConvertToNumpyArray(fp, arr)
     return arr
