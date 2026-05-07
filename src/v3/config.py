@@ -131,6 +131,15 @@ CHEMPROP_PARAMS = dict(
     ensemble_size=int(os.environ.get("CHEMPROP_ENS", 5)),
 )
 
+# ----- CheMeleon foundation-model pretraining (optional) -----------------
+# Set the env var ``CHEMELEON`` to one of:
+#   "1"  / "true" / "auto"   -> use chemprop's bundled CheMeleon downloader
+#                               (chemprop>=2.2 ships it as ``mol_atom_bond.foundation``;
+#                                older versions you must give an explicit path)
+#   "/path/to/chemeleon.pt"  -> load this exact checkpoint
+#   anything else / unset    -> do NOT use CheMeleon (default)
+CHEMELEON = os.environ.get("CHEMELEON", "").strip()
+
 # ----- TabPFN ------------------------------------------------------------
 TABPFN_PARAMS = dict(
     # TabPFN v2 supports up to ~10000 samples and ~500 features. We feed

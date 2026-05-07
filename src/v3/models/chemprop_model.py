@@ -42,6 +42,81 @@ def _check_chemprop():
         )
 
 
+def _try_load_chemeleon_mp(target_mp, depth: int, hidden_size: int):
+    """Optionally initialise our BondMessagePassing block with CheMeleon
+    pre-trained weights.
+
+    Resolution order, controlled by ``config.CHEMELEON`` (env var ``CHEMELEON``):
+
+      "0"/""/unset                -> no-op
+      "1"/"true"/"auto"           -> use chemprop's built-in
+                                     ``foundation.ChemeleonFoundation`` if present
+      "<path/to/checkpoint.pt>"   -> load that file directly
+
+    Returns ``True`` if weights were loaded, ``False`` otherwise.  Never
+    fatal — falls through to random init with a warning if anything goes
+    wrong.
+    """
+    from .. import config as _cfg
+    spec = _cfg.CHEMELEON
+    if not spec or spec.lower() in ("0", "false", "no"):
+        return False
+
+    import torch as _torch
+    auto = spec.lower() in ("1", "true", "auto")
+
+    # ---- Path mode ---------------------------------------------------------
+    if not auto:
+        try:
+            ckpt = _torch.load(spec, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = _torch.load(spec, map_location="cpu")
+        sd = ckpt.get("state_dict", ckpt)
+        # Strip prefixes that come from checkpoints saved on a wrapper module
+        cleaned = {}
+        for k, v in sd.items():
+            for pref in ("message_passing.", "model.message_passing.",
+                         "mp.", "model.mp."):
+                if k.startswith(pref):
+                    cleaned[k[len(pref):]] = v
+                    break
+            else:
+                cleaned[k] = v
+        missing, unexpected = target_mp.load_state_dict(cleaned, strict=False)
+        print(f"  CheMeleon: loaded weights from {spec}  "
+              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        return True
+
+    # ---- Auto mode (chemprop>=2.2 ships CheMeleon as a foundation) --------
+    for mod_path, attr in (
+        ("chemprop.foundation_models",   "ChemeleonFoundation"),
+        ("chemprop.foundation_models",   "Chemeleon"),
+        ("chemprop.featurizers",         "ChemeleonFoundation"),
+    ):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            cls = getattr(mod, attr, None)
+            if cls is None:
+                continue
+            foundation = cls()  # most chemprop versions auto-download
+            # The foundation often exposes a ``.message_passing`` attr.
+            src_mp = getattr(foundation, "message_passing", None) or getattr(
+                foundation, "mp", None) or foundation
+            target_mp.load_state_dict(src_mp.state_dict(), strict=False)
+            print(f"  CheMeleon: loaded via {mod_path}.{attr}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+
+    print(f"  CheMeleon: requested but auto-download failed "
+          f"({type(last_err).__name__}: {last_err}). "
+          "Falling back to random init. To use a manual checkpoint, set "
+          "CHEMELEON=/path/to/chemeleon.pt")
+    return False
+
+
 def _resolve_chemprop_api():
     """Locate Chemprop's API objects across v2.0–v2.x naming changes.
 
@@ -218,6 +293,15 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     mp = BondMessagePassing(depth=CHEMPROP_PARAMS["depth"],
                             d_h=CHEMPROP_PARAMS["hidden_size"],
                             dropout=CHEMPROP_PARAMS["dropout"])
+    # Optional CheMeleon pre-trained init for the message-passing block.
+    # No-op unless config.CHEMELEON is set. Never fatal.
+    try:
+        _try_load_chemeleon_mp(mp,
+                               depth=CHEMPROP_PARAMS["depth"],
+                               hidden_size=CHEMPROP_PARAMS["hidden_size"])
+    except Exception as _e:  # noqa: BLE001
+        print(f"  CheMeleon init failed ({type(_e).__name__}: {_e}); "
+              "continuing with random weights.")
     agg = MeanAggregation()
     ffn = RegressionFFN(n_tasks=len(short_cols))
     metric_list = [MAE()]
