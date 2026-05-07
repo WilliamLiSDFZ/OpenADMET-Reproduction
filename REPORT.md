@@ -2,18 +2,29 @@
 
 **项目**：`OpenADMET-LightGBM-Reproduction/`
 **作者**：Yuze Li
-**日期**：2026-05-03
-**最佳成绩**：MA-RAE = **0.750**（v1 + selective augmentation）
+**日期**：2026-05-03（v1/v2 部分）／ 2026-05-05（v3 更新）
+**最佳成绩**：MA-RAE = **0.677**（v3 多模型 ensemble，含 Chemprop two-pass + TabPFN + LGBM/XGB/CatBoost/RF）
+
+> 历史最佳记录：v1 + selective augmentation = 0.750（CPU only, 5 分钟）；v3 全栈 = 0.677（T4，~90 分钟）
 
 ---
 
 ## 0. TL;DR
 
-- 复现了 [OpenADMET-ExpansionRx Blind Challenge](https://huggingface.co/spaces/openadmet/OpenADMET-ExpansionRx-Challenge) 的官方 baseline 类方法（**LightGBM + RDKit-2d 描述符 + Morgan 指纹**）。
-- 用挑战赛官方 ground truth 做了 **9 次端到端实验**，每次都用官方 `python -m eval` 打分，全部用 macro-averaged Relative Absolute Error (**MA-RAE**) 比较。
-- 最佳结果 **MA-RAE = 0.750**（v1 baseline 是 0.756，selective external augmentation 把它压到 0.750）。
-- 读了 8 份前 10 名方法论 + JCIM 论文之后，挑了 3 个最容易移植的技巧（Avalon 指纹 / ADMET-AI 蒸馏特征 / SALI 活性悬崖 mask），**单独用、组合用全部都没赢过 selective augmentation**。
-- 关键 insight：**这套数据集小样本 endpoint + 强分布偏移**这个组合下，给 LightGBM 加更多特征/数据基本就是过拟合，进一步提升只能靠**架构换代**（Chemprop MPNN ensemble + 大规模预训练）或**专有 lead-optimization 数据**。
+- 复现了 [OpenADMET-ExpansionRx Blind Challenge](https://huggingface.co/spaces/openadmet/OpenADMET-ExpansionRx-Challenge) 的官方 baseline 类方法（**LightGBM + RDKit-2d 描述符 + Morgan 指纹**），并在此基础上一步步推进到了一个 **GPU 加速的多模型 ensemble (v3)**。
+- 全部实验都用挑战赛官方 ground truth + 官方 `python -m eval` 打分。
+- **核心结论数字**：
+  - v1 baseline (单 LightGBM)：MA-RAE = **0.756**
+  - v1 + selective external augmentation：**0.750**
+  - v2（Avalon / ADMET-AI 蒸馏 / SALI cliff mask 各种组合）：**0.757-0.802**，**全部不如 v1+selective**
+  - v3 classical-only (LGBM+XGB+CatBoost+RF)：**0.748**（CPU only, ~15 min）
+  - v3 + TabPFN (chemprop wt=0)：**0.744**
+  - v3 完整 ensemble（**Chemprop two-pass + TabPFN + 经典 ML**）：**0.677** ✅
+- 关键 insight：
+  1. 这套数据集**小样本 endpoint + 强分布偏移**，给单 LightGBM 加 feature 基本就是过拟合，v2 的所有 paper-inspired tricks 都没奏效。
+  2. 真正的突破来自 **架构换代**：Chemprop multi-task MPNN（按 task affinity 分 cluster）+ 多模型 NNLS-on-simplex ensemble。
+  3. **数据泄漏陷阱**：第一版 chemprop 让 NNLS 给它权重 1.00，原因是 chemprop 在全数据上训练，把 time-window val 也"见过"了——典型的 train→eval 泄漏。最终用 **two-pass 训练**（pass 1 用 70% 数据出 leak-free val 预测，pass 2 用 100% 数据出最强 test 预测）解决，是 v3 的核心 trick。
+  4. 离前 10 名估计的 0.4-0.5 区间还有 0.07-0.13 的差距，主要瓶颈是**专有 lead-optimization 数据**（4/5 of top 5 用了）和 **CheMeleon / KERMT 大规模预训练**（GPU + 大数据集）。
 
 ---
 
@@ -368,19 +379,22 @@ USE_AVALON=1 USE_DISTILL=0 USE_CLIFF=1 EXT_PROFILE=selective \
 
 ## 7. 后续建议（按 ROI 排序）
 
+> 2026-05-05 更新：§7.1 / §7.2 中 **粗体✅** 标记的项目已在 v3 完成（详见 §11）。
+
 ### 7.1 高 ROI（不需要 GPU）
 
-1. **多模型 ensemble (XGBoost + LightGBM + RandomForest)**：3 份前 10 名报告都用了；CPU 可跑；预期 -0.01 ~ -0.02。
-2. **TabPFN v2 替代 / 补充 LightGBM**：JCIM 论文图 6/7 显示在 ADME 上 surprising 强且**不需要训练**；预期 -0.02 但要本地验证。
-3. **任务分组多任务 LightGBM**：按 Spearman 相关把 9 个 endpoint 分 cluster (LogD/LogS/PPB 一组, HLM/MLM 一组)，每组共享一些 LightGBM 基模型；前 10 名几乎都用；-0.01 ~ -0.02。
-4. **Endpoint-specific stacking + 本地 holdout 选 config**：上面表里"per-endpoint 最优"显示理论上限 0.733，但要靠**本地 holdout** 而不是 leaderboard 来选 config（防 overfit）；难度中等。
-5. **0 值 endpoint-specific 处理**：clearance/permeability 用"半最小非零"替代 0 后再 log；PPB 用 10⁻⁶；Inductive Bio 报告强调过；预期 -0.005。
+1. **✅ 多模型 ensemble (XGBoost + LightGBM + RandomForest + CatBoost) 已在 v3 实现**——单独贡献 −0.008（v3_classical=0.748）。
+2. **✅ TabPFN v2 已在 v3 实现**——单独贡献 −0.004（v3+TabPFN=0.744）。在 KSOL/MBPB 两个长尾分布 endpoint 上几乎全权（NNLS weight 0.66 / 0.74）。
+3. **✅ 任务分组多任务（Chemprop multi-task per cluster）已在 v3 实现**——是 v3 最大贡献（−0.067，从 0.744 降到 0.677）。
+4. **Endpoint-specific stacking + 本地 holdout 选 config**：v3 用 NNLS-on-simplex + time-window val 替代了一部分思想，但还可以更精细。
+5. **0 值 endpoint-specific 处理**：v3 的 `data.py` 里实现了，**但实际试了反而把 MA-RAE 推到 1.78**——KSOL 最小非零是 0.0029 μM，做 `log10(0.0029 * 1e-6) = -8.5` 引入了极端 outlier。最后还是退回到 v1 tutorial 的 `log10(x+1)` 方案。这是 §11 关键 lesson 之一。
 
 ### 7.2 中 ROI（需要 GPU 或大量数据）
 
-1. **Chemprop MPNN ensemble + CheMeleon 预训练**：前 10 名几乎人人都用；GPU 要求中等，单 GPU 几小时；预期 -0.05 ~ -0.1（最大单一来源的 boost）。
-2. **RIGR 数据扩增**（共振结构枚举）：一队报告的最大单一性能提升；CPU 可跑；预期 -0.02 ~ -0.05。
-3. **Mordred 描述符 + Jazzy 静电描述符**：JCIM 论文用了；CPU 可跑但慢（5326 化合物 ~3 分钟）；要小心同样的小 N 过拟合问题，建议**只对 N>1500 的 endpoint 加**。
+1. **✅ Chemprop MPNN ensemble 已在 v3 实现**——T4 上跑了 ~30 min × 2 pass = ~60 min。是单一最大 boost（−0.067）。
+   - 仍然 **未完成**：CheMeleon 预训练初始化（V3_README §"Known caveats" 第 1 条）。预期再 −0.02 ~ −0.04。
+2. **RIGR 数据扩增**（共振结构枚举）：一队报告的最大单一性能提升；CPU 可跑；预期 −0.02 ~ −0.05；尚未实现。
+3. **Mordred 描述符 + Jazzy 静电描述符**：v3 实现了 Mordred opt-in flag (`--mordred`) 但默认不启用；Jazzy 没做。这次 v3 的最佳成绩没用 Mordred；**值得在 v3 基础上加上看看**，预期 −0.005 ~ −0.01。
 
 ### 7.3 低 ROI 或不可行
 
@@ -403,14 +417,32 @@ USE_AVALON=1 USE_DISTILL=0 USE_CLIFF=1 EXT_PROFILE=selective \
 
 | 阶段 | MA-RAE | Macro R² | 备注 |
 |---|---:|---:|---|
-| 5-fold CV (训练集内部) | — | +0.675 | 只能内部验证 |
-| 80/20 holdout (官方 eval) | 0.494 | +0.689 | overoptimistic |
-| **真测试集 (v1 baseline)** | **0.756** | **+0.347** | 公平 baseline |
-| **真测试集 (selective aug)** | **0.750** | **+0.348** | **最佳成绩** ✅ |
-| 真测试集 (v2 各种组合) | 0.757 ~ 0.802 | -0.10 ~ +0.34 | 全部退化或持平 |
-| Per-endpoint cherry-pick (overfit 上限) | 0.733 | — | 不可信 |
+| 5-fold CV (训练集内部, v1) | — | +0.675 | 只能内部验证 |
+| 80/20 holdout (官方 eval, v1) | 0.494 | +0.689 | overoptimistic |
+| 真测试集 (v1 baseline) | 0.756 | +0.347 | 公平 baseline |
+| 真测试集 (v1 selective aug) | 0.750 | +0.348 | v1 最佳 |
+| 真测试集 (v2 各种组合) | 0.757 ~ 0.802 | −0.10 ~ +0.34 | 全部退化或持平 |
+| Per-endpoint cherry-pick (overfit 上限, v1+v2) | 0.733 | — | 不可信 |
+| **真测试集 (v3 classical only, CPU)** | **0.748** | +0.357 | LGBM+XGB+CatBoost+RF + NNLS |
+| **真测试集 (v3 + TabPFN)** | **0.744** | +0.360 | T4 几分钟 |
+| **真测试集 (v3 完整 ensemble, two-pass Chemprop)** | **0.677** | **+0.447** | **当前最佳** ✅ |
 | 估计前 10 名水平 | 0.4 ~ 0.6 | — | 据博客 |
 | Inductive Bio (#1) | 估计 0.4-0.5 | — | 据博客 |
+
+**v3 完整 ensemble 与 v1 baseline 的 per-endpoint 对比**：
+
+| Endpoint | v1 base | v3 完整 | Δ |
+|---|---:|---:|---:|
+| LogD | 0.629 | **0.460** | −0.169 ⬇️ |
+| KSOL | 0.858 | **0.671** | −0.187 ⬇️ |
+| MLM CLint | 0.929 | 0.867 | −0.062 |
+| HLM CLint | 0.814 | 0.788 | −0.026 |
+| Caco-2 Efflux | 0.774 | 0.817 | +0.043 |
+| Caco-2 Papp | 0.771 | 0.793 | +0.022 |
+| MPPB | 0.872 | **0.748** | −0.124 ⬇️ |
+| MBPB | 0.587 | **0.457** | −0.130 ⬇️ |
+| MGMB | 0.574 | **0.488** | −0.086 |
+| **Macro** | **0.756** | **0.677** | **−0.080** |
 
 ---
 
@@ -428,4 +460,141 @@ USE_AVALON=1 USE_DISTILL=0 USE_CLIFF=1 EXT_PROFILE=selective \
 
 ---
 
-*报告生成时间：2026-05-03*
+*报告生成时间：2026-05-03（v1 / v2 部分） / 2026-05-05（v3 部分）*
+
+---
+
+## 11. v3 Postscript: 突破到 MA-RAE = 0.677
+
+> 写在 v1 / v2 报告之后。背景：第 §4 节的诚实 negative results 说明
+> 单 LightGBM + 简单 trick 的天花板就是 0.75 上下。要继续向前 10 推进，
+> 必须**换架构**——多模型 ensemble + GNN（Chemprop）+ 严谨的 leak-free
+> 权重学习。这正是 v3 做的事。
+
+### 11.1 v3 架构
+
+```
+                       SMILES (5326 train + 2282 test)
+                                  │
+                  ┌───────────────┴───────────────┐
+                  ▼                               ▼
+          RDKit-2d + Morgan + Avalon         Chemprop v2 multi-task MPNN
+          (3289 维, 缓存到 .npz)             (按 task affinity 分 3 cluster)
+                  │                               │
+   ┌──────┬──────┴──┬──────────┬──────┐           │
+   ▼      ▼         ▼          ▼      ▼           ▼
+ LGBM   XGBoost  CatBoost   Random  TabPFN     Pass 1 (tr_idx 训练) → val 预测
+                            Forest  v2                          (leak-free)
+   (single-task per endpoint)                  Pass 2 (full-data 训练) → test 预测
+                                                                (最强)
+                  │
+                  ▼
+          per-endpoint NNLS-on-simplex 权重学习
+          (在 time-window val: 70/15/15 split, 按分子 ID 排序)
+                  │
+                  ▼
+                submission_v3.csv
+```
+
+**关键设计选择**：
+
+1. **6 个 base learner**：LightGBM / XGBoost / CatBoost / RandomForest（CPU）+ TabPFN v2（GPU 推理）+ Chemprop v2 multi-task MPNN（GPU 训练）。每个都对 9 个 endpoint 各产生一组预测。
+2. **Task affinity grouping**：参考 OpenADME team 的报告，按 endpoint 之间的 Spearman 相关性分 3 个 cluster：`solubility_binding`（LogD/LogS/MPPB/MBPB/MGMB）、`metabolism`（LogD/HLM/MLM）、`permeability`（LogD/LogS/Caco-Papp/Caco-Eff）。每个 cluster 一个 multi-task chemprop 模型，5 个 random seed 平均。
+3. **Time-window validation split**：把训练集按 `Molecule Name` 排序（这是时间代理），取前 70% 训练，中间 15% 做 NNLS 权重学习，剩 15% 当外部 holdout。**重要**：这个 split 比随机 K-fold 更接近 train→test 的真实分布偏移。
+4. **NNLS-on-simplex 权重学习**：每个 endpoint，在 val 集上独立学一组凸组合权重 (∑w_i = 1, w_i ≥ 0)，最小化 MAE。`scipy.optimize.minimize` 加 SLSQP。
+5. **Two-pass Chemprop**（解决数据泄漏，详见 §11.3）：
+   - Pass 1：在 tr_idx (3728 mols) 上训练 → 对 va_idx (800 mols) 推理 → val 预测**无泄漏**
+   - Pass 2：在**全 5326 mols** 上训练 → 对 test 推理 → test 预测**最强**
+   - Val 喂给 NNLS，test 给最终 submission
+
+### 11.2 v3 完整结果
+
+T4 上完整跑一次约 90 min（30 min Pass 1 + 30 min Pass 2 + 10 min 经典 ML + 5 min TabPFN + 余下时间在 ensemble + eval）。
+
+**MA-RAE = 0.677**，比 v1 baseline 低 0.080（−10.5% 相对降幅）。
+
+NNLS 学出来的 per-endpoint 权重（来自 `output/v3/ensemble_weights.csv`）：
+
+```
+LogD              chemprop dominant
+LogS (KSOL)       chemprop + tabpfn
+MLM CLint         chemprop + classical mix
+HLM CLint         chemprop + classical mix
+Caco-2 Efflux     classical/tabpfn dominant (chemprop 在这里翻车了)
+Caco-2 Papp       classical/tabpfn dominant
+MPPB              chemprop + classical mix
+MBPB              chemprop + tabpfn
+MGMB              chemprop + classical mix
+```
+
+正是希望的效果——chemprop 强的 endpoint 用 chemprop，chemprop 弱的（Caco-2 系列）用经典 ML 救场。
+
+### 11.3 v3 关键 Lesson：数据泄漏陷阱（最危险也最长的 debug）
+
+**第一版 v3** 的 chemprop 模型在**全 train.csv (5326 mols)** 上训练（包含 time-window val 的 800 mols），然后对 va_idx 推理得 val 预测。NNLS 看到这些"完美"的 val 预测，给 chemprop **每个 endpoint 都 1.00 权重**。等于把 chemprop 单独的 test 预测当 ensemble 输出。
+
+**结果**：MA-RAE = 0.707，看似不错（比 v3 classical 0.748 还低），但 R² = **−2.40**（灾难性的负相关），Caco-2 Papp 的 RAE 飙到 1.094（比均值预测器还差 9%）。这是个 trap：MAE 看着好但 R² 烂掉，说明 ensemble 学出来的不是泛化解。
+
+**修复**：让 chemprop 只在 **tr_idx (3728 mols)** 上训练，va_idx 完全 hold out。这样 val 预测是 leak-free 的，NNLS 学到诚实的权重。
+
+**结果（leak-free 但 chemprop 只见 70% 数据）**：MA-RAE = 0.759，R² = +0.34。诚实但成绩**回退**——因为 chemprop 损失了 30% 训练数据，test 预测质量也下降了。
+
+**最终方案：two-pass 训练**（mirror classical 模型的做法）：
+- Pass 1：tr_idx 训练 → val 预测（leak-free，给 NNLS）
+- Pass 2：full data 训练 → test 预测（最强）
+- NNLS 用 leak-free val 学权重，权重应用到 full-data test 预测
+
+**结果**：**MA-RAE = 0.677**, R² = **+0.447**。诚实 + 最强，两者兼得。
+
+### 11.4 v3 之后还能怎么推进
+
+接 §7 后续建议表，按 ROI 排：
+
+| 改进 | 预期 ΔRAE | 是否需要 GPU | 难度 |
+|---|---:|---|---|
+| **CheMeleon 预训练初始化 chemprop**（V3_README 已知 caveat 第 1 条） | −0.02 ~ −0.04 | 是 | 中 |
+| **Chemprop ensemble size 5 → 10 seeds** | −0.005 ~ −0.01 | 是 | 低 |
+| **Mordred 描述符 (`--mordred` flag)** | −0.005 ~ −0.01 | 否 | 低 |
+| **Per-endpoint Optuna 调参**（特别针对 Caco-2 Efflux/Papp） | −0.01 ~ −0.03 | 否 | 中 |
+| **RIGR 共振结构数据扩增** | −0.02 ~ −0.05 | 否 | 高 |
+| **Polaris/Novartis 外部 ADME 数据** | −0.01 ~ −0.02 | 否 | 中 |
+| **Endpoint-specific 模型选择** + 用 nested CV 选 config 防 overfit | −0.005 ~ −0.02 | 否 | 高 |
+
+如果都加上，**理论上**能压到 **0.55-0.62 区间**——前 10 边缘。
+
+### 11.5 v3 项目文件
+
+```
+src/v3/
+├── config.py             所有超参 / 路径 / endpoint 配置 / TASK_GROUPS
+├── data.py               loading + log 变换（含零值处理 lesson 注释）
+├── features.py           RDKit + Morgan + Avalon (+ 可选 Mordred)
+├── splits.py             random / scaffold / time-window split
+├── ensemble.py           NNLS-on-simplex 凸组合解
+├── run.py                端到端入口 (`python -m src.v3.run`)
+├── backfill_chemprop_val.py  从 saved checkpoint 重生成 val 预测的工具
+└── models/
+    ├── lgbm_model.py
+    ├── xgb_model.py
+    ├── catboost_model.py
+    ├── rf_model.py
+    ├── tabpfn_model.py
+    └── chemprop_model.py   多版本 API 适配 + two-pass 训练支持
+```
+
+完整使用文档见 `V3_README.md`，T4 部署指南 + 故障排除见 `CLAUDE.md`。
+
+### 11.6 v3 部分新增的 Lessons Learned
+
+接 §8 个人 reflection：
+
+6. **多模型 ensemble 比单一强模型更稳**：单 chemprop 的 R²=−2.40（Caco-2 Papp 翻车）变成 ensemble 的 R²=+0.447，关键就是 NNLS 让 chemprop 的失败 endpoint 让位给经典 ML。架构多样性比模型本身的"先进性"更重要。
+7. **数据泄漏不一定让 MAE 变烂——有时反而看起来更好**。leaked chemprop 给出的 0.707 在 MA-RAE 单一指标上比 leak-free 的 0.759 看着好，但 R² 暴露了真相。**永远要看多个指标**，特别是相关性指标（R² / Spearman）。
+8. **复用其他论文的 trick 时**，先想清楚：他们的实验设定下这个 trick 解决了什么具体问题？我们的设定下这个问题真的存在吗？例如 Inductive Bio 的 "0 → half-min" 处理在他们的数据上 OK，但在我们 KSOL 最小非零 = 0.0029 μM 这个具体场景下会引入 −8.5 的极端 outlier。
+9. **two-pass 训练**（一次为 val，一次为 test）是 stacking ensemble 的标准做法，但很多教程不强调。这次 v3 因为忘了这个，浪费了一次完整 chemprop 训练循环（~30 min T4）才发现。CLAUDE.md §3.6 把这个坑明确记下来了。
+10. **mid-sized GPU (T4) 跑 chemprop 比预期快很多**——50 epochs × 5326 分子 × batch_size=64 的 multi-task MPNN 在 T4 上 ~2 min 一个 cluster-seed。15 个跑下来 ~30 min。我之前估计的 4-6 小时偏保守了 8-12 倍。
+
+---
+
+*v3 部分更新时间：2026-05-05*
+

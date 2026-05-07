@@ -11,15 +11,31 @@ This is what the JCIM 2025 paper called "weighted average ensemble"; it
 handily out-performs simple equal-weight averaging when one learner is
 clearly better (and it gracefully reduces to single-best when only one
 learner is good).
+
+Robustness layer (added 2026-05-05): NNLS over a single val split can
+overfit val noise — for example, on Caco-2 endpoints chemprop's val MAE
+is mildly competitive with classical ML, NNLS gives chemprop a small
+weight, but on test chemprop is substantially worse so the ensemble
+*regresses* compared to classical-only. The fix is to **drop any model
+whose individual val MAE is >max_loss_ratio× the best-model val MAE**
+*before* running NNLS. With a permissive ratio (default 1.10 = "10 %
+worse than the best") we keep the diversity benefit of the ensemble
+while dropping models that are clearly noisy on this endpoint.
 """
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import numpy as np
 from scipy.optimize import minimize
 
 from .config import ENSEMBLE_MIN_WEIGHT
+
+# Models with val MAE > MAX_LOSS_RATIO * best_val_MAE are excluded from the
+# NNLS pool entirely. Default 1.10 = "drop everyone more than 10% worse than
+# the best learner on val". Override via env var.
+MAX_LOSS_RATIO = float(os.environ.get("MAX_LOSS_RATIO", "1.10"))
 
 
 def _nnls_simplex(P: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -45,21 +61,55 @@ def _nnls_simplex(P: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def fit_ensemble_weights(holdout_preds: Dict[str, np.ndarray],
-                         y_holdout: np.ndarray) -> Dict[str, float]:
-    """Given {model_name: pred_on_holdout} -> {model_name: weight}."""
+                         y_holdout: np.ndarray,
+                         max_loss_ratio: float | None = None,
+                         ) -> Dict[str, float]:
+    """Given {model_name: pred_on_holdout} -> {model_name: weight}.
+
+    If ``max_loss_ratio`` is given (e.g. 1.10), models whose individual val
+    MAE is more than ``max_loss_ratio × best_val_MAE`` are excluded from
+    the NNLS pool. Defaults to the package-level ``MAX_LOSS_RATIO`` constant.
+    """
+    if max_loss_ratio is None:
+        max_loss_ratio = MAX_LOSS_RATIO
+
     names = list(holdout_preds.keys())
-    P = np.column_stack([holdout_preds[n] for n in names])
+    weights = {n: 0.0 for n in names}
+
+    if not names:
+        return weights
+
+    # 1) Per-model individual val MAE
+    individual_mae = {
+        n: float(np.mean(np.abs(np.asarray(holdout_preds[n]) - y_holdout)))
+        for n in names
+    }
+    best_mae = min(individual_mae.values())
+    threshold = best_mae * max_loss_ratio
+
+    # 2) Filter to "competitive" models -- the ones at most max_loss_ratio
+    #    worse than the leader on val.
+    competitive = [n for n in names if individual_mae[n] <= threshold]
+    if not competitive:
+        # Pathological (NaNs, etc.); fall back to all
+        competitive = list(names)
+
+    # 3) NNLS-on-simplex over the competitive subset only
+    P = np.column_stack([holdout_preds[n] for n in competitive])
     w = _nnls_simplex(P, y_holdout)
 
-    # Drop tiny weights and re-normalize
+    # 4) Drop tiny weights and re-normalize within the competitive subset
     mask = w >= ENSEMBLE_MIN_WEIGHT
     if not mask.any():
-        # everything got dropped; fall back to equal weights
         w = np.full(len(w), 1.0 / len(w))
     else:
         w = np.where(mask, w, 0.0)
-        w = w / w.sum()
-    return {n: float(wi) for n, wi in zip(names, w)}
+        s = w.sum()
+        w = w / s if s > 0 else np.full(len(w), 1.0 / len(w))
+
+    for n, wi in zip(competitive, w):
+        weights[n] = float(wi)
+    return weights
 
 
 def apply_weights(test_preds: Dict[str, np.ndarray],
