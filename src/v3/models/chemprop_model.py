@@ -42,79 +42,113 @@ def _check_chemprop():
         )
 
 
-def _try_load_chemeleon_mp(target_mp, depth: int, hidden_size: int):
-    """Optionally initialise our BondMessagePassing block with CheMeleon
-    pre-trained weights.
+CHEMELEON_URL = "https://zenodo.org/records/15460715/files/chemeleon_mp.pt"
+CHEMELEON_CACHE = ".chemprop/chemeleon_mp.pt"   # under user's home
 
-    Resolution order, controlled by ``config.CHEMELEON`` (env var ``CHEMELEON``):
 
-      "0"/""/unset                -> no-op
-      "1"/"true"/"auto"           -> use chemprop's built-in
-                                     ``foundation.ChemeleonFoundation`` if present
-      "<path/to/checkpoint.pt>"   -> load that file directly
+def _download_chemeleon_ckpt() -> "Path | None":
+    """Mirror of chemprop CLI's CHEMELEON download path: ``~/.chemprop/chemeleon_mp.pt``.
+    Downloads from Zenodo on first use, then caches.
 
-    Returns ``True`` if weights were loaded, ``False`` otherwise.  Never
-    fatal — falls through to random init with a warning if anything goes
-    wrong.
+    Returns the cached path or None on failure.
     """
+    from pathlib import Path
+    from urllib.request import urlretrieve
+
+    ckpt_dir = Path.home() / ".chemprop"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    model_path = ckpt_dir / "chemeleon_mp.pt"
+    if model_path.exists() and model_path.stat().st_size > 1_000_000:
+        return model_path
+    print(f"  CheMeleon: downloading from Zenodo to {model_path} (~30 MB)…")
+    try:
+        urlretrieve(CHEMELEON_URL, model_path)
+        print(f"  CheMeleon: downloaded ({model_path.stat().st_size/1e6:.1f} MB)")
+        return model_path
+    except Exception as e:  # noqa: BLE001
+        print(f"  CheMeleon: download failed ({type(e).__name__}: {e})")
+        return None
+
+
+def get_chemeleon_message_passing(BondMessagePassing):
+    """Return a BondMessagePassing block initialised with CheMeleon weights.
+
+    Returns ``None`` (and logs a warning) if CHEMELEON is disabled, the
+    download fails, or the checkpoint can't be loaded for any reason —
+    the caller should then construct a randomly-initialised block.
+
+    Reads the env var ``CHEMELEON`` (``config.CHEMELEON``):
+      ""/"0"/"false"/"no"            -> disabled, return None
+      "1"/"true"/"auto"              -> auto-download from Zenodo
+      "<path/to/chemeleon_mp.pt>"    -> load that checkpoint directly
+    """
+    from pathlib import Path
+    import torch
+
     from .. import config as _cfg
     spec = _cfg.CHEMELEON
     if not spec or spec.lower() in ("0", "false", "no"):
-        return False
+        return None
 
-    import torch as _torch
     auto = spec.lower() in ("1", "true", "auto")
+    if auto:
+        ckpt_path = _download_chemeleon_ckpt()
+        if ckpt_path is None:
+            return None
+    else:
+        ckpt_path = Path(spec).expanduser()
+        if not ckpt_path.exists():
+            print(f"  CheMeleon: file not found at {ckpt_path}")
+            return None
 
-    # ---- Path mode ---------------------------------------------------------
-    if not auto:
-        try:
-            ckpt = _torch.load(spec, map_location="cpu", weights_only=False)
-        except TypeError:
-            ckpt = _torch.load(spec, map_location="cpu")
-        sd = ckpt.get("state_dict", ckpt)
-        # Strip prefixes that come from checkpoints saved on a wrapper module
-        cleaned = {}
-        for k, v in sd.items():
-            for pref in ("message_passing.", "model.message_passing.",
-                         "mp.", "model.mp."):
-                if k.startswith(pref):
-                    cleaned[k[len(pref):]] = v
-                    break
-            else:
-                cleaned[k] = v
-        missing, unexpected = target_mp.load_state_dict(cleaned, strict=False)
-        print(f"  CheMeleon: loaded weights from {spec}  "
-              f"(missing={len(missing)}, unexpected={len(unexpected)})")
-        return True
+    # Try the safer weights_only=True load first (matches chemprop's CLI),
+    # fall back to the unsafe one if needed.
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+    except Exception as e:  # noqa: BLE001
+        print(f"  CheMeleon: load failed ({type(e).__name__}: {e})")
+        return None
 
-    # ---- Auto mode (chemprop>=2.2 ships CheMeleon as a foundation) --------
-    for mod_path, attr in (
-        ("chemprop.foundation_models",   "ChemeleonFoundation"),
-        ("chemprop.foundation_models",   "Chemeleon"),
-        ("chemprop.featurizers",         "ChemeleonFoundation"),
-    ):
-        try:
-            import importlib
-            mod = importlib.import_module(mod_path)
-            cls = getattr(mod, attr, None)
-            if cls is None:
-                continue
-            foundation = cls()  # most chemprop versions auto-download
-            # The foundation often exposes a ``.message_passing`` attr.
-            src_mp = getattr(foundation, "message_passing", None) or getattr(
-                foundation, "mp", None) or foundation
-            target_mp.load_state_dict(src_mp.state_dict(), strict=False)
-            print(f"  CheMeleon: loaded via {mod_path}.{attr}")
-            return True
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            continue
+    if not isinstance(ckpt, dict) or "hyper_parameters" not in ckpt or "state_dict" not in ckpt:
+        print(f"  CheMeleon: unexpected checkpoint structure at {ckpt_path}")
+        return None
 
-    print(f"  CheMeleon: requested but auto-download failed "
-          f"({type(last_err).__name__}: {last_err}). "
-          "Falling back to random init. To use a manual checkpoint, set "
-          "CHEMELEON=/path/to/chemeleon.pt")
-    return False
+    try:
+        mp = BondMessagePassing(**ckpt["hyper_parameters"])
+        mp.load_state_dict(ckpt["state_dict"])
+    except Exception as e:  # noqa: BLE001
+        print(f"  CheMeleon: state_dict load failed ({type(e).__name__}: {e})")
+        return None
+
+    print(f"  CheMeleon: ✓ loaded from {ckpt_path} "
+          f"(hidden_size={ckpt['hyper_parameters'].get('d_h', '?')})")
+    return mp
+
+
+def _maybe_v2_featurizer(Featurizer):
+    """CheMeleon was pretrained with the V2 atom-featurizer, so when we use
+    CheMeleon we MUST use V2 too (chemprop CLI enforces this with an error).
+
+    Returns a featurizer instance — V2 if CheMeleon is requested, default
+    otherwise.
+    """
+    from .. import config as _cfg
+    if not _cfg.CHEMELEON or _cfg.CHEMELEON.lower() in ("0", "false", "no"):
+        return Featurizer()
+
+    # chemprop's V2 atom featurizer; live in chemprop.featurizers.atom
+    try:
+        import importlib
+        atom_mod = importlib.import_module("chemprop.featurizers.atom")
+        AF = getattr(atom_mod, "MultiHotAtomFeaturizer", None)
+        if AF is not None and hasattr(AF, "v2"):
+            return Featurizer(atom_featurizer=AF.v2())
+    except Exception:
+        pass
+    # Fallback: default featurizer (most chemprop 2.2+ versions default to V2)
+    return Featurizer()
 
 
 def _resolve_chemprop_api():
@@ -272,7 +306,7 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
     holdout_data = [MoleculeDatapoint.from_smi(s, np.zeros(len(short_cols), dtype=np.float32))
                     for s in holdout_smis]
 
-    featurizer = Featurizer()
+    featurizer = _maybe_v2_featurizer(Featurizer)
     train_dset   = MoleculeDataset(tr, featurizer)
     val_dset     = MoleculeDataset(va, featurizer)
     test_dset    = MoleculeDataset(test_data, featurizer)
@@ -290,20 +324,32 @@ def train_multitask(train_df: pd.DataFrame, test_df: pd.DataFrame,
                       if holdout_dset is not None else None)
 
     # ---- Model -------------------------------------------------------------
-    mp = BondMessagePassing(depth=CHEMPROP_PARAMS["depth"],
-                            d_h=CHEMPROP_PARAMS["hidden_size"],
-                            dropout=CHEMPROP_PARAMS["dropout"])
-    # Optional CheMeleon pre-trained init for the message-passing block.
-    # No-op unless config.CHEMELEON is set. Never fatal.
+    # If CHEMELEON is set, build the BondMessagePassing block from the
+    # pretrained checkpoint (which dictates its own hidden_size/depth);
+    # otherwise fall back to randomly-initialised one with our hyperparams.
+    mp = None
     try:
-        _try_load_chemeleon_mp(mp,
-                               depth=CHEMPROP_PARAMS["depth"],
-                               hidden_size=CHEMPROP_PARAMS["hidden_size"])
+        mp = get_chemeleon_message_passing(BondMessagePassing)
     except Exception as _e:  # noqa: BLE001
         print(f"  CheMeleon init failed ({type(_e).__name__}: {_e}); "
               "continuing with random weights.")
+    if mp is None:
+        mp = BondMessagePassing(depth=CHEMPROP_PARAMS["depth"],
+                                d_h=CHEMPROP_PARAMS["hidden_size"],
+                                dropout=CHEMPROP_PARAMS["dropout"])
     agg = MeanAggregation()
-    ffn = RegressionFFN(n_tasks=len(short_cols))
+    # Use the message-passing block's actual output_dim for the FFN, in case
+    # CheMeleon's hidden_size differs from our config default.
+    ffn_kwargs = {"n_tasks": len(short_cols)}
+    if hasattr(mp, "output_dim"):
+        ffn_kwargs["input_dim"] = mp.output_dim
+    elif hasattr(mp, "d_h"):
+        ffn_kwargs["input_dim"] = mp.d_h
+    try:
+        ffn = RegressionFFN(**ffn_kwargs)
+    except TypeError:
+        # Older API: RegressionFFN doesn't take input_dim
+        ffn = RegressionFFN(n_tasks=len(short_cols))
     metric_list = [MAE()]
     model = MPNN(mp, agg, ffn, batch_norm=True, metrics=metric_list)
 
