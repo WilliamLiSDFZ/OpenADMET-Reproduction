@@ -24,7 +24,10 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from ..config import CHEMPROP_PARAMS, ENDPOINT_PREP, RANDOM_STATE, TASK_GROUPS, V3_OUT
+from ..config import (
+    CHEMPROP_PARAMS, ENDPOINT_PREP, PRIMARY_GROUP_FOR_ENDPOINT,
+    RANDOM_STATE, TASK_GROUPS, V3_OUT,
+)
 from ..data import log_transform_endpoint
 
 
@@ -403,18 +406,44 @@ def train_all_clusters(train_df: pd.DataFrame, test_df: pd.DataFrame,
     Pass ``train_indices`` (and ``val_indices``) to keep an external held-out
     set leak-free for ensemble weight learning. Without those, training uses
     the full train_df (legacy behaviour, kept for backward compat).
+
+    HybridADMET behaviour: each endpoint's prediction comes from EXACTLY ONE
+    cluster (its ``PRIMARY_GROUP_FOR_ENDPOINT`` mapping), not averaged across
+    every cluster that happens to include it. This matches Shuo Zhang et al.,
+    who reported ~0.6 MA-RAE.
     """
     seeds = seeds or list(range(CHEMPROP_PARAMS["ensemble_size"]))
+
+    # Build the inverse map: cluster -> list of "primary-of" short_names
+    # (i.e. which endpoints should pull their predictions out of this cluster)
+    primary_shorts_in_cluster: Dict[str, set] = {c: set() for c in TASK_GROUPS}
+    for assay, cluster in PRIMARY_GROUP_FOR_ENDPOINT.items():
+        if cluster not in primary_shorts_in_cluster:
+            raise SystemExit(
+                f"PRIMARY_GROUP_FOR_ENDPOINT references unknown cluster {cluster!r}"
+            )
+        primary_shorts_in_cluster[cluster].add(ENDPOINT_PREP[assay][2])
+
     accumulator: Dict[str, List[np.ndarray]] = {}
     for cluster_name, endpoints in TASK_GROUPS.items():
+        primaries = primary_shorts_in_cluster[cluster_name]
+        if not primaries:
+            print(f"== Chemprop  cluster={cluster_name} skipped "
+                  f"(no endpoint claims it as primary) ==")
+            continue
         for seed in seeds:
-            print(f"== Chemprop  cluster={cluster_name}  seed={seed} ==")
+            print(f"== Chemprop  cluster={cluster_name}  seed={seed}  "
+                  f"(primary for {sorted(primaries)}) ==")
             preds = train_multitask(
                 train_df, test_df, cluster_name, endpoints, seed=seed,
                 train_indices=train_indices, val_indices=val_indices,
             )
+            # Only keep predictions for endpoints that picked THIS cluster
+            # as their primary multi-task config (HybridADMET style).
             for k, v in preds.items():
-                accumulator.setdefault(k, []).append(v)
+                short = k.split("__")[0]      # strip "__test" / "__val"
+                if short in primaries:
+                    accumulator.setdefault(k, []).append(v)
 
     averaged = {k: np.mean(np.stack(v_list), axis=0)
                 for k, v_list in accumulator.items()}

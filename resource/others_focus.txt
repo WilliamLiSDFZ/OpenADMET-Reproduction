@@ -1,0 +1,55 @@
+Methodology Report
+
+Team Name: HybridADMET
+Members: Shuo Zhang, Lianjin Cai, Amitesh Badkul, Taoyu Niu, Xibing He, Lei Xie
+Description of the Model
+Model Architecture
+Our approach is a hybrid model that integrates 3 molecular representations:
+Uni-Mol2 (Transformer, https://openreview.net/forum?id=64V40K2fDv&noteId=J41KhtPFiO)
+PAMNet (GNN, https://www.nature.com/articles/s41598-023-46382-8)
+Molecular fingerprints (MACCS, ErG, and PubChem)
+
+
+We initialize the Uni-Mol2 encoder with publicly available pre-trained checkpoints. During fine-tuning, all model parameters (Uni-Mol2, PAMNet, and the fingerprint branch) are updated end-to-end.
+Training Data
+We fine-tune our models only on the official training dataset released by the organizers: https://huggingface.co/datasets/openadmet/openadmet-expansionrx-challenge-train-data
+
+We do not use external/private datasets or perform any additional pre-training. Our only pre-trained component is the publicly released Uni-Mol2 checkpoint, which was pre-trained solely on molecular structural information and does not use any property labels or ADMET data.
+Training Strategy
+Preprocessing. We follow the data preprocessing pipeline provided in the organizer’s tutorial, without additional steps.
+Splitting. We use a 5-fold scaffold split.
+Target-specific modeling. We train separate models (and, when appropriate, different input target groups) for different endpoints to better match task-specific characteristics:
+
+
+Target
+Training data
+LogD
+LogD
+KSOL
+LogD, KSOL, MLM, HLM, Efflux, Papp
+MLM
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB, MBPB, MGMB
+HLM
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB
+Efflux
+LogD, KSOL, Efflux, Papp
+Papp
+LogD, KSOL, Efflux, Papp
+MPPB
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB
+MBPB
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB, MBPB, MGMB
+MGMB
+LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB, MBPB, MGMB
+
+
+Model selection. We select the final configuration based on performance on the public leaderboard, using it to choose the best-performing model variants.
+Performance comments
+Adding the fingerprint branch yields a notable improvement for Efflux and Papp. For other endpoints, fingerprints provide limited gains; however, the Uni-Mol2 + PAMNet backbone already achieves performance comparable to our final submissions.
+
+Unsuccessful Attempts:
+We explored several alternatives that did not lead to improvements, including:
+Descriptor-based machine learning baselines and some features from commercial software packages.
+Adding GAFF2 atom types as an additional descriptor.
+Imbalance-aware training via Label Distribution Smoothing (LDS) to mitigate long-tailed label distributions: LDS weights were computed per endpoint after preprocessing (inverse to a smoothed label-density estimate) and applied during loss computation.
+

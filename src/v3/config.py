@@ -76,17 +76,50 @@ ENDPOINT_PREP = {
     "MGMB":                          (True,  1.0,  "Log_Mouse_MPB",    "tutorial"),
 }
 
-# Task affinity grouping. Cluster compositions follow the OpenADME team
-# (https://openadmet.ghost.io ‘Lessons Learned’) which used Spearman
-# correlation on training labels to define multi-task groups for Chemprop.
+# Task affinity grouping for Chemprop multi-task training.
+#
+# Updated 2026-05-05 to follow the HybridADMET team (Shuo Zhang et al, who
+# achieved ~0.6 MA-RAE) more closely than the OpenADME 3-cluster split.
+# Their key observations:
+#   - LogD is best trained ALONE (any other endpoint becomes negative transfer)
+#   - small-N PB endpoints (MBPB, MGMB) want as many auxiliary tasks as possible
+#   - permeability (Efflux/Papp) only benefits from physico-chem tasks (LogD/KSOL)
+#   - metabolism (MLM/HLM) benefits from PPB but not BPB/MPB
+#
+# Concretely, HybridADMET defined 9 per-endpoint multi-task configs that
+# de-duplicate down to 5 unique training-set tuples below.
 TASK_GROUPS = {
-    "solubility_binding": ["LogD", "KSOL", "MPPB", "MBPB", "MGMB"],
-    "metabolism":          ["LogD", "MLM CLint", "HLM CLint"],
-    "permeability":        ["LogD", "KSOL", "Caco-2 Permeability Papp A>B",
-                            "Caco-2 Permeability Efflux"],
+    "logd_alone":          ["LogD"],
+    "ksol_centric":        ["LogD", "KSOL", "MLM CLint", "HLM CLint",
+                            "Caco-2 Permeability Efflux",
+                            "Caco-2 Permeability Papp A>B"],
+    "perm_only":           ["LogD", "KSOL",
+                            "Caco-2 Permeability Efflux",
+                            "Caco-2 Permeability Papp A>B"],
+    "metab_plus_mppb":     ["LogD", "KSOL", "MLM CLint", "HLM CLint",
+                            "Caco-2 Permeability Efflux",
+                            "Caco-2 Permeability Papp A>B", "MPPB"],
+    "all_nine":            ["LogD", "KSOL", "MLM CLint", "HLM CLint",
+                            "Caco-2 Permeability Efflux",
+                            "Caco-2 Permeability Papp A>B",
+                            "MPPB", "MBPB", "MGMB"],
 }
-# LogD intentionally appears in every cluster -- it's the strongest single
-# predictor of bulk physicochemical properties for the other endpoints.
+
+# For each endpoint, which TASK_GROUPS cluster's prediction head we use.
+# (Different from the 3-cluster system where LogD was averaged across all
+# clusters that included it -- HybridADMET takes ONLY the head of the
+# endpoint's "primary" cluster.)
+PRIMARY_GROUP_FOR_ENDPOINT = {
+    "LogD":                          "logd_alone",
+    "KSOL":                          "ksol_centric",
+    "MLM CLint":                     "all_nine",
+    "HLM CLint":                     "metab_plus_mppb",
+    "Caco-2 Permeability Efflux":    "perm_only",
+    "Caco-2 Permeability Papp A>B":  "perm_only",
+    "MPPB":                          "metab_plus_mppb",
+    "MBPB":                          "all_nine",
+    "MGMB":                          "all_nine",
+}
 
 # ----- Data splits --------------------------------------------------------
 RANDOM_STATE = 42
