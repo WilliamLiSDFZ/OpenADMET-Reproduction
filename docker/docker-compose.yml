@@ -1,0 +1,54 @@
+# docker-compose stack for openadmet-v4
+# Usage:
+#   cd docker
+#   docker compose up -d v4            # detached, training runs in background
+#   docker compose logs -f v4          # tail training logs
+#   docker compose down                # stop and remove the container
+#
+# After `up -d` you can disconnect SSH; the container keeps running.
+
+services:
+  v4:
+    image: openadmet-v4:latest
+    build:
+      context: ..                       # project root, so COPY copies the source
+      dockerfile: docker/Dockerfile
+    container_name: openadmet-v4
+    restart: unless-stopped             # auto-restart if the host reboots
+    runtime: nvidia                     # NVIDIA Container Toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # ---- tweak these to control the run ----
+      V4_EPOCHS: "60"
+      V4_BATCH: "32"
+      V4_ENS: "5"
+      UNIMOL_FINETUNE: "1"
+      UNIMOL_MODEL: "84M"
+      EVAL_REPO: "/eval"
+      V4_GIT_PULL: "0"                  # set "1" to git-pull on each restart
+      PYTHONPATH: "/workspace"
+    shm_size: "8gb"                     # PyG / DataLoader workers need it
+    volumes:
+      # Mount your project so code edits take effect without rebuild
+      - ..:/workspace
+      # Persist outputs OUTSIDE the container so checkpoints survive
+      - ../output:/workspace/output
+      # The official-eval repo (so the container can score predictions)
+      - ${EVAL_REPO_HOST:-../../ExpansionRx-Challenge-Eval}:/eval:ro
+      # Cache foundation-model checkpoints so we don't re-download every run
+      - openadmet-cache:/root/.cache
+      - openadmet-chemprop:/root/.chemprop
+    # If your host has nvidia-container-toolkit configured (the standard
+    # setup on GCP/AWS/Lambda GPU VMs), the `runtime: nvidia` line above
+    # exposes the T4. Otherwise:
+    #     docker run --gpus all ...
+
+volumes:
+  openadmet-cache:
+  openadmet-chemprop:

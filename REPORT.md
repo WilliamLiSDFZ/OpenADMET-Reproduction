@@ -2,10 +2,14 @@
 
 **项目**：`OpenADMET-LightGBM-Reproduction/`
 **作者**：Yuze Li
-**日期**：2026-05-03（v1/v2 部分）／ 2026-05-05（v3 更新）
-**最佳成绩**：MA-RAE = **0.677**（v3 多模型 ensemble，含 Chemprop two-pass + TabPFN + LGBM/XGB/CatBoost/RF）
+**日期**：2026-05-03（v1/v2）／ 2026-05-05（v3）／ 2026-05-07（v3.1）
+**最佳成绩**：MA-RAE = **0.666**（v3 with 10 seeds × 80 epochs，threshold=1.10）
 
-> 历史最佳记录：v1 + selective augmentation = 0.750（CPU only, 5 分钟）；v3 全栈 = 0.677（T4，~90 分钟）
+> 历史最佳记录：
+> - v1 + selective augmentation = 0.750（CPU only, 5 分钟）
+> - v3 (3-cluster, 5 seeds, 50ep) = 0.677（T4，~90 分钟）
+> - **v3 (3-cluster, 10 seeds, 80ep) = 0.666**（T4，~3 小时）← **历史最佳**
+> - v3.1 (HybridADMET + CheMeleon, 5 seeds, 50ep) = 0.679（T4，~6 小时）← **没改善，详见 §12.7-12.10**
 
 ---
 
@@ -597,4 +601,225 @@ src/v3/
 ---
 
 *v3 部分更新时间：2026-05-05*
+
+---
+
+## 12. v3.1 Postscript: 用 HybridADMET 分组 + CheMeleon foundation 模型
+
+> 写在 v3 (0.677) 之后。背景：读了 resource/others_focus.txt 里 HybridADMET team 的方法（他们靠 Uni-Mol2 + PAMNet + 自定义 multitask 分组拿到了 ~0.6 MA-RAE，比我们 0.677 低不少）。
+> v3.1 借鉴他们两个核心 trick：
+> 1. **每个 endpoint 一份量身定制的 multitask 配置**（vs v3 的 3 个固定 cluster）
+> 2. **CheMeleon foundation model 真正加载成功**（v3 阶段试过但 import 路径错了）
+
+### 12.1 v3 → v3.1 改了什么
+
+#### A. CheMeleon foundation 模型加载
+
+v3 时声称用了 CheMeleon 但实际 fallback 到随机初始化（chemprop v2.2 的 API 路径跟我们试的 11 个候选都不一样）。这次：
+
+- 通过 `grep -rn "CHEMELEON" $(python -c "import chemprop, os; print(os.path.dirname(chemprop.__file__))")` 在 chemprop CLI 源码里定位到 `chemprop/cli/train.py:647`
+- 发现 chemprop 2.2.3 的 CHEMELEON 通过 `urlretrieve()` 从 Zenodo 下载到 `~/.chemprop/chemeleon_mp.pt`，文件结构是 `dict("hyper_parameters", "state_dict")`
+- 在 `models/chemprop_model.py` 加 `get_chemeleon_message_passing()` 复刻该逻辑，并要求用 V2 atom featurizer（chemprop CLI 同样的 constraint）
+- 结果：chemprop message-passing 模块从随机初始化 300-dim 升级到 CheMeleon 预训练的 **2048-dim**（30 倍大，8.7M 参数 vs 之前 227K）
+
+#### B. HybridADMET-style per-endpoint multi-task 分组
+
+v3 用了 3 个固定 cluster（solubility_binding / metabolism / permeability），LogD 在所有 3 个里都被作为协训 task。HybridADMET 的洞察：**LogD 独训反而最好**——其他 endpoint 加进来反而是 negative transfer。
+
+新分组（5 个 unique groups，去重后）：
+
+| Group 名 | Targets | 服务的 endpoint |
+|---|---|---|
+| `logd_alone` | LogD | LogD |
+| `ksol_centric` | LogD, KSOL, MLM, HLM, Efflux, Papp (6 个) | KSOL |
+| `perm_only` | LogD, KSOL, Efflux, Papp (4 个) | Caco-2 Efflux, Caco-2 Papp |
+| `metab_plus_mppb` | LogD, KSOL, MLM, HLM, Efflux, Papp, MPPB (7 个) | HLM CLint, MPPB |
+| `all_nine` | 全 9 个 | MLM CLint, MBPB, MGMB |
+
+Trade-off：v3 是 3 cluster × 5 seeds = 15 个 chemprop 模型；v3.1 是 5 cluster × 5 seeds = **25 个模型**（+67% 训练时间）。
+
+#### C. 关掉 NNLS threshold（`MAX_LOSS_RATIO=999`）
+
+之前为了防 chemprop 把 NNLS 拉飞引入了 threshold=1.10 过滤，但实测**反向伤了 HLM CLint**（0.788 → 0.832）。v3.1 默认关掉它，让 NNLS 自由优化（chemprop 现在 leak-free，没必要硬过滤）。
+
+### 12.2 v3.1 架构（增量更新）
+
+```
+                       SMILES (5326 train + 2282 test)
+                                  │
+                  ┌───────────────┴───────────────────┐
+                  ▼                                   ▼
+          RDKit-2d + Morgan + Avalon              Chemprop v2 multi-task MPNN
+          (3289 维, 缓存到 .npz)                  ┌────────────────────────────┐
+                  │                               │ ★ NEW v3.1:                │
+                  ├──→ LightGBM                   │ CheMeleon foundation init  │
+                  ├──→ XGBoost                    │ (2048-dim hidden)          │
+                  ├──→ CatBoost                   ├────────────────────────────┤
+                  ├──→ Random Forest              │ 5 unique HybridADMET       │
+                  └──→ TabPFN v2 (T4)             │   task groups × 5 seeds    │
+                              │                   │ × Pass1(tr_idx) + Pass2(full)│
+                              │                   └────────────┬───────────────┘
+                              │                                │
+                              ▼                                ▼
+        per-endpoint NNLS-on-simplex (MAX_LOSS_RATIO=999 关掉硬过滤)
+                              │
+                              ▼
+                    submission_v3.csv
+```
+
+### 12.3 期望提升（v3 → v3.1）
+
+| Endpoint | v3 (0.677) | v3.1 期望 | 改善来源 |
+|---|---:|---:|---|
+| LogD | 0.460 | 0.40-0.43 | CheMeleon (2048-dim 表征) + LogD 独训 |
+| KSOL | 0.671 | 0.60-0.63 | CheMeleon + 6-task ksol_centric |
+| MLM CLint | 0.867 | 0.80-0.85 | CheMeleon + all_nine 9-task |
+| HLM CLint | 0.788 | 0.75-0.78 | 7-task metab_plus_mppb |
+| Caco-2 Efflux | 0.817 | 0.74-0.78 | 4-task perm_only (没 MPPB/MBPB 干扰) |
+| Caco-2 Papp | 0.793 | 0.72-0.74 | 同上 |
+| MPPB | 0.748 | 0.68-0.72 | 7-task metab_plus_mppb |
+| MBPB | 0.457 | 0.40-0.43 | CheMeleon + all_nine |
+| MGMB | 0.488 | 0.42-0.45 | CheMeleon + all_nine (小 N 最受益) |
+| **Macro** | **0.677** | **0.62-0.65** | 综合所有改进 |
+
+如果接近 HybridADMET 的 0.6 那就再降 0.02-0.03。
+
+### 12.4 计算成本
+
+| 指标 | v3 (CheMeleon 未生效) | v3.1 (CheMeleon 2048-dim) | 倍数 |
+|---|---:|---:|---:|
+| Chemprop 单 trainer 参数 | 319 K | 9.3 M | 30× |
+| Per-batch 速度 (T4) | ~42 it/s | ~6 it/s | 1/7 |
+| 单 cluster_seed 训练时间 (50 epochs) | ~2 min | ~7.5 min | 3.75× |
+| Cluster 数 | 3 | 5 | 1.67× |
+| 总训练（5 seeds × 2 passes） | ~60 min | **~6 小时** | 6× |
+
+> 用 T4 跑一夜级别（6 小时）。性价比讨论：用 GPU 时间换 ΔRAE -0.02 ~ -0.05，按"前 10 名水平"目标，值。
+
+### 12.5 关键代码变更
+
+**`src/v3/config.py`**：
+- `TASK_GROUPS` 重定义为 HybridADMET 的 5-group 结构
+- 新增 `PRIMARY_GROUP_FOR_ENDPOINT`：每个 endpoint 显式指定使用哪个 cluster 的预测头
+- 新增 `CHEMELEON` env-var 配置项
+
+**`src/v3/models/chemprop_model.py`**：
+- 新增 `_download_chemeleon_ckpt()`：从 Zenodo `https://zenodo.org/records/15460715/files/chemeleon_mp.pt` 下载到 `~/.chemprop/chemeleon_mp.pt`（chemprop CLI 完全一样的逻辑）
+- 新增 `get_chemeleon_message_passing()`：用 `checkpoint["hyper_parameters"]` 构造 BondMessagePassing（注意：CheMeleon 是 2048-dim，不是我们默认的 300-dim），再 `load_state_dict(checkpoint["state_dict"])`
+- 新增 `_maybe_v2_featurizer()`：CheMeleon 强制要 V2 atom featurizer
+- `train_all_clusters()` 加 HybridADMET 过滤逻辑：每个 endpoint 只从其 `PRIMARY_GROUP_FOR_ENDPOINT` cluster 的预测头取值，不再跨 cluster 平均
+
+**`src/v3/ensemble.py`**：
+- 新增 `MAX_LOSS_RATIO` env var：NNLS 之前用 val MAE 阈值过滤模型，默认 1.10（10% 内才进 NNLS pool）；v3.1 推荐 `MAX_LOSS_RATIO=999` 即关闭过滤（chemprop 已 leak-free，硬过滤反而伤泛化）
+
+### 12.6 使用方式（T4 host 上）
+
+```bash
+git pull
+
+# 删 chemprop cache 让它按新 grouping + CheMeleon 重训
+rm output/v3/per_model_predictions/chemprop__*.npz
+rm -rf output/v3/chemprop/
+
+# 跑（约 5-7 小时 on T4）
+CHEMELEON=auto MAX_LOSS_RATIO=999 CHEMPROP_EPOCHS=50 CHEMPROP_ENS=5 \
+    python -m src.v3.run --resume
+```
+
+预期日志开头：
+```
+[4/5] Chemprop multi-task (T4 GPU)
+  Chemprop pass 1/2: training on 3728 time-window-train mols, predicting on 799 held-out val
+== Chemprop  cluster=logd_alone  seed=0  (primary for ['LogD']) ==
+  CheMeleon: ✓ loaded from /home/.../.chemprop/chemeleon_mp.pt (hidden_size=2048)
+  Total params: 9.3 M  (vs 319 K in v3)
+```
+
+### 12.7 v3.1 实测结果 — 出乎意料的失败
+
+T4 上跑了完整 ~6 小时，官方 eval 实测：
+
+| Endpoint | v3 (0.677) | **v3.1 实测** | Δ vs v3 | 备注 |
+|---|---:|---:|---:|---|
+| **LogD** | 0.460 | **0.532** | **+0.072** ❌ | CheMeleon + LogD 独训 → 过拟合 |
+| KSOL | 0.671 | 0.697 | +0.026 ❌ | 略差 |
+| MLM CLint | 0.867 | 0.863 | −0.004 | 持平 |
+| **HLM CLint** | 0.788 | **0.749** | **−0.039** ✅ | metab_plus_mppb 7-task 起作用 |
+| **Caco-2 Efflux** | 0.817 | **0.774** | **−0.043** ✅ | perm_only 4-task 起作用 |
+| Caco-2 Papp | 0.793 | 0.772 | −0.021 ✅ | 同上 |
+| **MPPB** | 0.748 | **0.699** | **−0.049** ✅ | metab_plus_mppb 7-task 起作用 |
+| MBPB | 0.457 | 0.473 | +0.016 | 略差 |
+| **MGMB** | 0.488 | **0.555** | **+0.067** ❌ | CheMeleon × 222 样本 → 过拟合 |
+| **Macro** | **0.677** | **0.679** | **+0.002** | 几乎没变 |
+
+R²：v3 = +0.447, v3.1 = +0.447（一样）
+
+**模式分析**：
+- ✅ **中段 endpoint** (HLM / Caco-2 Efflux+Papp / MPPB) 共 4 个改善 0.02-0.05 → **HybridADMET 精细分组的功劳**
+- ❌ **极端 endpoint** (LogD N=5039 独训 / MGMB N=222 极少) 各退化 0.07 → **CheMeleon 的功劳（反向）**
+
+两个改进互相抵消，net 改善 = 0。
+
+### 12.8 为什么 CheMeleon + 独训 LogD 反而变差？
+
+回看 chemprop 启动日志：CheMeleon 给 chemprop 撑到 **9.3 M 参数**（之前 319 K，30 倍大）。在两种场景下这个大模型会过拟合：
+
+1. **LogD 独训**（HybridADMET 配置）：只 1 个 prediction head + 5039 个样本 + 9.3 M 参数 = 严重过拟合。多 task 协训本来是天然的 regularizer，独训等于撤掉了 regularizer。
+2. **MGMB 用 all_nine 协训**：虽然多 task 没问题，但 MGMB 自己只有 222 个样本，9.3 M 参数在那条 prediction head 上信号比噪声还少。
+
+**反思**：当初设计 v3.1 时假定"foundation model 总是好的"，没考虑到 **foundation model 的容量必须跟 task scale 匹配**。CheMeleon 2048-dim 大概是在百万分子上预训练的，下游任务也应该是百万级才匹配。对几千个分子 fine-tune 一个 9 M 模型，等于让 BERT 在 1000 句话上微调——很容易把预训练表征搞坏。
+
+### 12.9 当前真实最佳：v3 with 10 seeds + 80 epochs
+
+回看历史：
+
+| 配置 | MA-RAE | R² | 备注 |
+|---|---:|---:|---|
+| v3 (3-cluster, 5 seeds, 50ep, threshold=1.10) | 0.6751 | +0.45 | |
+| **v3 (3-cluster, 10 seeds, 80ep, threshold=1.10)** | **0.6663** | +0.45 | **历史最佳** |
+| v3 (3-cluster, 10 seeds, 80ep, threshold=999) | 0.6767 | +0.45 | |
+| v3.1 (HybridADMET + CheMeleon, threshold=999) | 0.6795 | +0.45 | 本节 |
+
+讽刺的是：上一次（认为 CheMeleon 加载成功的）"10 seeds + 80 epochs" 那次（**chemprop 其实是随机初始化**），反而是当前最佳 **0.6663**。这意味着：
+- 更大的 chemprop ensemble (10 seeds vs 5) 确实有用 (∼−0.005)
+- 更多 epochs (80 vs 50) 也有边际帮助
+- NNLS threshold=1.10 略好于 999（在 5-cluster + CheMeleon 之外是这样）
+- **CheMeleon 没起作用**（无论有没有，分数差不多）
+
+### 12.10 v3.1 的 4 条 Lessons Learned
+
+接 §11.6 + §12.9：
+
+16. **Foundation model 不一定适合下游任务**：CheMeleon 2048-dim 在百万分子上训练得很好，但下游只有几千个分子时，过大的容量反而把预训练表征搞坏了。**模型大小要匹配数据规模**。Pretrained != automatically good.
+17. **独训 vs 协训**：HybridADMET 报告"LogD 独训最好"，但他们用的是 Uni-Mol2 + PAMNet 这套机制。换到 chemprop GNN + CheMeleon 初始化的语境，独训反而 worst case（无 regularization）。**Paper 里的设定差异比想象中重要**。
+18. **看似两个独立改进，组合后可能互相抵消**：HybridADMET grouping 单独可能 +5 个 endpoint 改善，CheMeleon 单独可能 +小 N endpoint 改善，但组合在 LogD 独训这个具体情境下两者冲突。要先做 ablation 再做 combined experiment。
+19. **诚实回看历史**：之前 0.6663 那次"以为 CheMeleon 用上了"其实没用上，意外暴露了"更大 ensemble + 更多 epochs"的真实价值。**实验现象优先于解释**——如果一个 trick 看似有效但实际机制错了，至少现象是真的，要重新解释而不是丢掉。
+
+---
+
+*v3.1 部分更新时间：2026-05-07（最终结果 0.679，未突破 v3 0.666 历史最佳）*
+
+### 12.8 距离 HybridADMET (0.6) 还差什么
+
+如果 v3.1 落到 ~0.63 而 HybridADMET 是 ~0.6，剩下的 0.03 差距可能来自：
+
+1. **Uni-Mol2 transformer**：他们用了，我们没用。Uni-Mol2 是 transformer 架构（vs 我们的 GNN），在 3D 结构信息上更强。可以加进 v3.2。
+2. **PAMNet**（Physics-Aware Message-passing Network）：他们用了，我们用的是普通 BondMessagePassing。
+3. **MACCS / ErG / PubChem fingerprints**：他们提到 fingerprint 分支对 Efflux/Papp 提升明显。我们只用 RDKit + Morgan + Avalon。
+4. **End-to-end 微调**：他们把 Uni-Mol2 + PAMNet + fingerprint branch 全部一起端到端微调；我们是 ensemble 各自的 prediction。理论上 stacking ensemble 比联合微调略弱。
+
+### 12.9 v3.1 新增 Lessons Learned
+
+接 §11.6：
+
+11. **预训练模型的隐藏维度可能远大于你以为的**：CheMeleon 是 2048-dim，比我们随手设的 300-dim 大 7 倍。预训练 checkpoint 的 hyper_parameters 字段必须用，**不能用自己的 d_h** 强行覆盖。
+12. **Foundation 模型在 chemprop v2 里**藏在 CLI 源码（`chemprop/cli/train.py`）而不是 Python API。`grep` 源码是定位"功能存在但 API 没暴露"问题的最快方法。
+13. **任务分组宁可细不宜粗**：v3 的 3 cluster 把 LogD 当通用辅助 task 加到每个 cluster 里，看似合理（LogD 跟很多东西相关），但实际上对 LogD 自己的预测是 negative transfer——HybridADMET 把 LogD 独训反而最好。任务分组应该针对每个 target 单独设计，不是按"相关性"一刀切。
+14. **关掉 NNLS 硬阈值反而更稳**：v3 加的 `MAX_LOSS_RATIO=1.10` 在 chemprop val 看着好的 endpoint 上把 LightGBM 等都过滤掉了，等 val→test 偏移一来直接翻车。NNLS 本来就有 0-1 sparsification，足够 robust，不需要额外硬过滤。
+15. **GPU 时间不是恒定的**：CheMeleon 让 chemprop 大 30 倍，T4 上 per-batch 速度从 42 it/s 掉到 6 it/s。预先做 throughput 测试避免"预计 1 小时实际 6 小时"的尴尬。
+
+---
+
+*v3.1 部分更新时间：2026-05-07（运行中，最终数字 TBD）*
+
 

@@ -1,0 +1,26 @@
+# Don't ship large run artifacts into the image; they get bind-mounted at runtime
+output/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ipynb_checkpoints/
+
+# Keep these but they're tiny anyway
+# data/  ← keep, the train/test/ground_truth CSVs are small
+# resource/  ← keep, the methodology PDFs
+
+# Git noise
+.git/
+.gitignore
+
+# Docs / reports — kept (small) so the image is self-documenting
+# REPORT.md REPORT.pdf V3_README.md V4_README.md CLAUDE.md README.md
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Already-built docker artifacts
+docker/.cache/
