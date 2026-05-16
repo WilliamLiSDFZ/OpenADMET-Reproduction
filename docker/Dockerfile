@@ -17,15 +17,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=UTC
 
-# ---- System deps (Python 3.11, Java for PaDEL, build tools) ----
+# ---- System deps (Python 3.10 default Ubuntu 22.04, Java for PaDEL, build tools) ----
+# We use Python 3.10 (the Ubuntu 22.04 default) to avoid needing the
+# deadsnakes PPA. torch / unimol_tools / chemprop all support 3.10.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev python3-pip \
+        python3 python3-dev python3-pip \
         default-jre-headless \
         git curl wget ca-certificates \
         build-essential \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3
+    && ln -sf /usr/bin/python3 /usr/bin/python
 
 # ---- Python deps in layers (cacheable) ----
 # Core scientific stack first (changes rarely → top layer for cache hit)
@@ -36,8 +37,12 @@ RUN pip install --upgrade pip wheel setuptools \
 # Classical ML stack
 RUN pip install lightgbm xgboost catboost
 
-# PyTorch + PyG stack (the big one — pick a torch version matched to CUDA 12.4)
-RUN pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124 \
+# PyTorch + PyG stack
+# Torch 2.5.1 + CUDA 12.4 prebuilt wheels for PyG ops live at
+#   https://data.pyg.org/whl/torch-2.5.0+cu124.html
+# (the URL slug always says torch-2.5.0 even for 2.5.1 patch releases).
+RUN pip install torch==2.5.1 torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu124 \
     && pip install torch-geometric \
     && pip install torch-scatter torch-sparse torch-cluster \
         -f https://data.pyg.org/whl/torch-2.5.0+cu124.html

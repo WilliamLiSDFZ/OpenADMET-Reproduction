@@ -1,5 +1,10 @@
 # Don't ship large run artifacts into the image; they get bind-mounted at runtime
 output/
+**/cache/
+**/*.npz
+**/*.pkl
+**/*.pt
+**/*.ckpt
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/
