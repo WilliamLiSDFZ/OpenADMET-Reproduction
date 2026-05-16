@@ -20,11 +20,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ---- System deps (Python 3.10 default Ubuntu 22.04, Java for PaDEL, build tools) ----
 # We use Python 3.10 (the Ubuntu 22.04 default) to avoid needing the
 # deadsnakes PPA. torch / unimol_tools / chemprop all support 3.10.
+#
+# X11 libs are required because rdkit.Chem.Draw (transitively imported by
+# unimol_tools via rdkit.Chem.PandasTools) dlopens libXrender, libXext,
+# libSM at module load — even when no plotting happens.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-dev python3-pip \
         default-jre-headless \
         git curl wget ca-certificates \
         build-essential \
+        libxrender1 libxext6 libsm6 libglib2.0-0 libgl1 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
