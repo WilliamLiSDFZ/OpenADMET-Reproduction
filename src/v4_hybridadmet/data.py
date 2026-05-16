@@ -94,23 +94,138 @@ def smiles_to_pyg_data(smiles: str, atoms, coords):
     )
 
 
+# ----- Uni-Mol2 dictionary loader -------------------------------------------
+# Uni-Mol2 ships a fairseq-format atom dictionary at
+# ``unimol_tools/weights/mol.dict.txt``. The encoder's atom-type embedding
+# table is sized by ``len(dictionary)`` and the GBF (Gaussian basis function)
+# embedding by ``len(dict)²``. If we feed raw atomic numbers as token ids,
+# H/C/N/O happen to work but P/S/Cl/Br/I overflow the table → CUDA assertion.
+_UNIMOL_DICT_CACHE = None
+
+
+def _load_unimol_dict():
+    """Return Uni-Mol2's atom Dictionary (fairseq-style). Cached.
+
+    Falls back to manual parsing if unimol_tools doesn't expose its
+    Dictionary class at any of the known import paths.
+    """
+    global _UNIMOL_DICT_CACHE
+    if _UNIMOL_DICT_CACHE is not None:
+        return _UNIMOL_DICT_CACHE
+
+    import importlib
+    from pathlib import Path
+    import unimol_tools
+
+    # Locate mol.dict.txt — shipped with unimol_tools weights/
+    pkg_dir = Path(unimol_tools.__file__).parent
+    dict_path = None
+    for cand in (pkg_dir / "weights" / "mol.dict.txt",
+                  pkg_dir / "data" / "mol.dict.txt",
+                  pkg_dir / "mol.dict.txt"):
+        if cand.exists():
+            dict_path = cand
+            break
+    if dict_path is None:
+        raise FileNotFoundError(
+            f"Couldn't find mol.dict.txt anywhere in {pkg_dir}")
+
+    # Try unimol_tools' own Dictionary class across known API paths
+    for mod_name in (
+        "unimol_tools.data.dictionary",
+        "unimol_tools.data",
+        "unimol_tools.utils.dictionary",
+        "unimol_tools.utils",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            Dictionary = getattr(mod, "Dictionary", None)
+            if Dictionary is None:
+                continue
+            d = Dictionary.load(str(dict_path))
+            _UNIMOL_DICT_CACHE = d
+            print(f"  Loaded Uni-Mol2 dictionary via {mod_name}.Dictionary "
+                  f"({len(d)} tokens)")
+            return d
+        except (ImportError, AttributeError, Exception):  # noqa: BLE001
+            continue
+
+    # Fallback: manual fairseq-style parsing
+    class _ManualDict:
+        def __init__(self, symbols, specials):
+            self._idx = dict(specials)
+            n = len(specials)
+            for s in symbols:
+                if s not in self._idx:
+                    self._idx[s] = n
+                    n += 1
+            self._inv = {v: k for k, v in self._idx.items()}
+
+        def index(self, sym):
+            return self._idx.get(sym, self._idx.get("[UNK]", 3))
+
+        def __len__(self):
+            return max(self._idx.values()) + 1
+
+        def cls(self): return self._idx.get("[CLS]", 0)
+        def unk(self): return self._idx.get("[UNK]", 3)
+        def pad(self): return self._idx.get("[PAD]", 1)
+
+    with open(dict_path) as f:
+        symbols = [line.strip().split()[0] for line in f if line.strip()]
+    specials = {"[CLS]": 0, "[PAD]": 1, "[SEP]": 2, "[UNK]": 3, "[MASK]": 4}
+    d = _ManualDict(symbols, specials)
+    print(f"  Loaded Uni-Mol2 dictionary via manual fallback "
+          f"({len(d)} tokens, specials={list(specials.keys())})")
+    _UNIMOL_DICT_CACHE = d
+    return d
+
+
+def _atom_symbol(z: int) -> str:
+    from rdkit.Chem import GetPeriodicTable
+    return GetPeriodicTable().GetElementSymbol(int(z))
+
+
 # ----- Uni-Mol2 input packing -----------------------------------------------
 def pack_unimol_input(atoms: np.ndarray, coords: np.ndarray) -> dict:
-    """Build the per-molecule dict Uni-Mol2's collator expects.
+    """Build the per-molecule dict Uni-Mol2's encoder expects.
 
-    The exact keys depend on the unimol_tools version. We provide the
-    minimum subset (``src_tokens``, ``src_coord``, ``src_distance``,
-    ``src_edge_type``) that the latest stable 2024-2025 release uses.
+    Uni-Mol2 input convention:
+      * Prepend a ``[CLS]`` token at position 0 (used as molecule-level pool).
+      * ``src_tokens`` are indices INTO mol.dict.txt, NOT raw atomic numbers.
+      * ``src_edge_type[i,j] = src_tokens[i] * n_dict + src_tokens[j]``
+        — i.e. the multiplier is the dictionary size, so edge types fit
+        inside an embedding table of size ``n_dict²``.
+      * The CLS row in ``src_coord`` is placed at the molecule's centroid
+        (this is what the Uni-Mol2 authors do).
     """
-    n = len(atoms)
-    # Atom type tokens: use raw atomic numbers (Uni-Mol2's dict maps Z -> token).
-    src_tokens = torch.tensor(atoms, dtype=torch.long)
-    src_coord  = torch.tensor(coords, dtype=torch.float32)
-    # Pairwise distance matrix (n, n)
+    d = _load_unimol_dict()
+    n_dict = len(d)
+    cls_idx = d.cls() if hasattr(d, "cls") else d.index("[CLS]")
+    unk_idx = d.unk() if hasattr(d, "unk") else d.index("[UNK]")
+
+    tokens = [cls_idx]
+    for z in atoms:
+        sym = _atom_symbol(int(z))
+        try:
+            tokens.append(d.index(sym))
+        except (KeyError, ValueError):
+            tokens.append(unk_idx)
+
+    n = len(tokens)                                    # = len(atoms) + 1
+    src_tokens = torch.tensor(tokens, dtype=torch.long)
+
+    # CLS coordinate at molecule centroid (Uni-Mol2 convention)
+    coords_arr = np.asarray(coords, dtype=np.float32)
+    cls_coord = coords_arr.mean(axis=0, keepdims=True)
+    src_coord = torch.tensor(
+        np.concatenate([cls_coord, coords_arr], axis=0), dtype=torch.float32)
+
     diff = src_coord.unsqueeze(0) - src_coord.unsqueeze(1)
     src_distance = (diff * diff).sum(dim=-1).clamp(min=1e-12).sqrt()
-    # Edge type (atom-pair type): outer product of token ids
-    src_edge_type = src_tokens.unsqueeze(0) * src_tokens.unsqueeze(1)
+
+    src_edge_type = src_tokens.unsqueeze(0) * n_dict + src_tokens.unsqueeze(1)
+
     return {
         "src_tokens": src_tokens,
         "src_coord": src_coord,
