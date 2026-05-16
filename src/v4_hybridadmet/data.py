@@ -119,16 +119,37 @@ def _load_unimol_dict():
 
     # Locate mol.dict.txt — shipped with unimol_tools weights/
     pkg_dir = Path(unimol_tools.__file__).parent
-    dict_path = None
-    for cand in (pkg_dir / "weights" / "mol.dict.txt",
+    candidates = [pkg_dir / "weights" / "mol.dict.txt",
                   pkg_dir / "data" / "mol.dict.txt",
-                  pkg_dir / "mol.dict.txt"):
-        if cand.exists():
-            dict_path = cand
-            break
+                  pkg_dir / "mol.dict.txt"]
+    dict_path = next((p for p in candidates if p.exists()), None)
+
     if dict_path is None:
-        raise FileNotFoundError(
-            f"Couldn't find mol.dict.txt anywhere in {pkg_dir}")
+        # The dict gets auto-downloaded the first time UniMolModel is built.
+        # If we're called before that, trigger it now.
+        print("  mol.dict.txt missing -- triggering unimol_tools download…")
+        try:
+            from unimol_tools.weights.weighthub import weight_download
+            for fname in ("mol.dict.txt", "mol_pre_all_h_220816.pt"):
+                try:
+                    weight_download(str(pkg_dir / "weights"), fname)
+                except Exception as e:  # noqa: BLE001
+                    print(f"    weight_download({fname}) failed: "
+                          f"{type(e).__name__}: {e}")
+        except ImportError:
+            # Last resort: instantiate UniMolModel to make it fetch
+            try:
+                from unimol_tools.models.unimol import UniMolModel
+                _ = UniMolModel(output_dim=512)
+                del _
+            except Exception as e:  # noqa: BLE001
+                raise FileNotFoundError(
+                    f"mol.dict.txt not found and auto-download failed: {e}"
+                ) from e
+        dict_path = next((p for p in candidates if p.exists()), None)
+        if dict_path is None:
+            raise FileNotFoundError(
+                f"mol.dict.txt still missing after download attempt in {pkg_dir}")
 
     # Try unimol_tools' own Dictionary class across known API paths
     for mod_name in (
@@ -236,18 +257,23 @@ def pack_unimol_input(atoms: np.ndarray, coords: np.ndarray) -> dict:
 
 
 # ----- Build per-molecule feature pack --------------------------------------
+# NOTE: We intentionally DO NOT call ``pack_unimol_input`` here. That function
+# needs the Uni-Mol2 atom dictionary (``mol.dict.txt``), which only gets
+# downloaded to ``unimol_tools/weights/`` the first time UniMolModel is
+# instantiated — which happens later in train_one, not at precompute time.
+# Building the Uni-Mol2 batch dict lazily inside collate_hybrid avoids
+# this ordering problem AND keeps the on-disk cache slim.
 def build_molecule_features(smiles: str, seed: int = 42) -> dict | None:
     atoms, coords = smiles_to_3d(smiles, seed=seed)
     if atoms is None:
         return None
     pyg_data = smiles_to_pyg_data(smiles, atoms, coords)
-    unimol_in = pack_unimol_input(atoms, coords)
     return {
         "smiles": smiles,
         "atoms": atoms,
         "coords": coords,
         "pyg": pyg_data,
-        "unimol": unimol_in,
+        # "unimol" packed lazily at collate time
     }
 
 
@@ -317,8 +343,11 @@ def collate_hybrid(batch_items, device=None):
     pyg_list = [it["molf"]["pyg"] for it in batch_items]
     pyg_batch = PyGBatch.from_data_list(pyg_list)
 
-    # Uni-Mol2 collator: pad along the atom dim.
-    unimol_dicts = [it["molf"]["unimol"] for it in batch_items]
+    # Uni-Mol2 collator: build per-molecule input dict NOW (lazy), so we don't
+    # depend on the Uni-Mol2 weights being downloaded at precompute time.
+    # If a cached pickle from an old version still has a "unimol" key, ignore it.
+    unimol_dicts = [pack_unimol_input(it["molf"]["atoms"], it["molf"]["coords"])
+                    for it in batch_items]
     max_n = max(d["n_atoms"] for d in unimol_dicts)
     B = len(unimol_dicts)
     src_tokens   = torch.zeros((B, max_n), dtype=torch.long)
