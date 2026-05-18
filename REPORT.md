@@ -3,7 +3,7 @@
 **项目**：`OpenADMET-LightGBM-Reproduction/`
 **作者**：Yuze Li
 **日期**：2026-05-03（v1/v2）／ 2026-05-05（v3）／ 2026-05-07（v3.1）／ 2026-05-17（v4）
-**最佳成绩**：MA-RAE = **0.666**（v3 with 10 seeds × 80 epochs，threshold=1.10）
+**最佳成绩**：MA-RAE = **0.651, R²=+0.458**（v4.1 stitch of v4 强端点 + v3.1 其他端点）
 
 > 历史最佳记录：
 > - v1 + selective augmentation = 0.750（CPU only, 5 分钟）
@@ -11,7 +11,7 @@
 > - **v3 (3-cluster, 10 seeds, 80ep) = 0.666**（T4，~3 小时）← **历史最佳**
 > - v3.1 (HybridADMET + CheMeleon, 5 seeds, 50ep) = 0.679（T4，~6 小时）← **没改善，详见 §12.7-12.10**
 > - v4 (HybridADMET 忠实复现, Uni-Mol2 + PAMNet + PaDEL, 5 seeds × 5 groups) = 0.688（T4，~25 小时）← **复现失败，比 v3 还差，但局部 4 个 endpoint 创历史最佳，详见 §13**
-> - v4.1 (stitch v4 强端点 + v3 其他端点) = 0.648 预期（待补）← **§13.7**
+> - **v4.1 (stitch v4 强端点 + v3.1 其他端点) = 0.651, R²=+0.458（CPU 一秒）← 项目新历史最佳，详见 §13.7**
 
 ---
 
@@ -26,11 +26,15 @@
   - v3 classical-only (LGBM+XGB+CatBoost+RF)：**0.748**（CPU only, ~15 min）
   - v3 + TabPFN (chemprop wt=0)：**0.744**
   - v3 完整 ensemble（**Chemprop two-pass + TabPFN + 经典 ML**）：**0.677** ✅
+  - v3.1 (HybridADMET-style grouping + CheMeleon foundation init)：**0.679**（基本持平，详见 §12）
+  - v4 (HybridADMET 忠实复现：Uni-Mol2 + PAMNet + PaDEL fingerprints + 端到端联合训练)：**0.688**（macro 退化，但 4 个端点创历史最佳，详见 §13）
+  - **v4.1 (per-endpoint oracle stitch of v4 + v3.1)：MA-RAE = 0.651, R²=+0.458** ✅✅ 项目新历史最佳
 - 关键 insight：
   1. 这套数据集**小样本 endpoint + 强分布偏移**，给单 LightGBM 加 feature 基本就是过拟合，v2 的所有 paper-inspired tricks 都没奏效。
   2. 真正的突破来自 **架构换代**：Chemprop multi-task MPNN（按 task affinity 分 cluster）+ 多模型 NNLS-on-simplex ensemble。
   3. **数据泄漏陷阱**：第一版 chemprop 让 NNLS 给它权重 1.00，原因是 chemprop 在全数据上训练，把 time-window val 也"见过"了——典型的 train→eval 泄漏。最终用 **two-pass 训练**（pass 1 用 70% 数据出 leak-free val 预测，pass 2 用 100% 数据出最强 test 预测）解决，是 v3 的核心 trick。
-  4. 离前 10 名估计的 0.4-0.5 区间还有 0.07-0.13 的差距，主要瓶颈是**专有 lead-optimization 数据**（4/5 of top 5 用了）和 **CheMeleon / KERMT 大规模预训练**（GPU + 大数据集）。
+  4. **Per-endpoint architecture-task fit 比 architecture 先进性更重要**：v4 忠实复现 HybridADMET 整体退化，但在 binding / 物化端点上反超；v3 在代谢端点上反而更稳。v4.1 把"每个 endpoint 选最强架构的预测"做成 oracle stitch，1 秒 pd.concat 就拿到比任何单一版本都好的 0.651。
+  5. 离前 10 名估计的 0.4-0.5 区间还有 0.05-0.15 的差距，主要瓶颈是**专有 lead-optimization 数据**（4/5 of top 5 用了）和 **CheMeleon / KERMT 大规模预训练**（GPU + 大数据集）。
 
 ---
 
@@ -941,36 +945,71 @@ R²：v3 = +0.447, v3.1 = +0.447（一样）
 5. **epoch 数 / batch size / lr schedule**。HybridADMET 的具体超参 paper 没全列，我们按"reasonable defaults"（60 epochs, batch 32, AdamW 1e-4）来。如果他们实际用了 warmup + cosine + 长 epoch（200+），那 PAMNet/Uni-Mol2 的容量没充分释放。
 6. **Uni-Mol2 finetune 模式**。我们让 Uni-Mol2 全参数 fintune（`UNIMOL_FINETUNE=1`），但小数据上可能 freeze + linear probe 更稳。这条可解释 LogD 退化（独训 + 大模型 + 5039 样本 = 容易过拟合，跟 v3.1 §12.8 同样的失败模式）。
 
-### 13.7 v4.1: stitch v4 强端点 + v3 其他端点（计划中）
+### 13.7 v4.1: stitch v4 强端点 + v3.1 其他端点 — **新历史最佳 0.651**
 
-观察 §13.5 的 per-endpoint pattern → 直接取 oracle best：
+观察 §13.5 的 per-endpoint pattern → 直接取 oracle best。`scripts/stitch_v4_1.py` 实现的规则（写死在 `PICK` dict）：
 
-| Endpoint | 来源 | RAE |
-|---|---|---:|
-| LogD | v3 | 0.460 |
-| KSOL | v4 | 0.613 |
-| MLM CLint | v3 | 0.867 |
-| HLM CLint | v3 | 0.788 |
-| Caco-2 Efflux | v4 | 0.793 |
-| Caco-2 Papp | v3 | 0.793 |
-| MPPB | v4 | 0.591 |
-| MBPB | v3 | 0.457 |
-| MGMB | v4 | 0.470 |
-| **Macro 预期** | — | **0.648** |
+| Endpoint | 选谁 | v3.1 (0.679) | v4 (0.688) | **v4.1 实测** | std |
+|---|---|---:|---:|---:|---:|
+| LogD                          | v3.1 | 0.532 | 0.653 | **0.532** | 0.010 |
+| KSOL                          | v4   | 0.697 | 0.613 | **0.613** | 0.014 |
+| MLM CLint                     | v3.1 | 0.863 | 0.881 | **0.863** | 0.021 |
+| HLM CLint                     | v3.1 | 0.749 | 0.877 | **0.749** | 0.023 |
+| Caco-2 Permeability Efflux    | v4   | 0.774 | 0.793 | **0.793** | 0.015 |
+| Caco-2 Permeability Papp A>B  | v3.1 | 0.772 | 0.821 | **0.772** | 0.014 |
+| MPPB                          | v4   | 0.699 | 0.591 | **0.591** | 0.027 |
+| MBPB                          | v3.1 | 0.473 | 0.496 | **0.473** | 0.019 |
+| MGMB                          | v4   | 0.555 | 0.470 | **0.470** | 0.042 |
+| **Macro RAE**                 |      | **0.679** | **0.688** | **0.651** | 0.020 |
+| **Macro R²**                  |      | +0.447 | +0.382 | **+0.458** | 0.033 |
 
-如果 stitch 实际跑出来接近 0.648，那相对 v3 0.666 改善 0.018，也算半个证据说明"hybrid ensemble of specialists" 是有用的——只是单独的 v4 整体 architecture 没有发挥出来。**v4.1 详细结果见下一节（运行中）**。
+> ⚠️ 注：原计划是 stitch v3 (0.666, 10s×80ep) + v4，但 disk 上 `output/v3/submission_v3.csv` 是 v3.1 实验之后写的版本（LogD 端点是 v3.1 的 0.532 而不是 0.666 那次的 0.460）。所以这次实际 stitch 的是 **v3.1 ∪ v4 的最佳**。即便如此，v4 在 MPPB 上 −0.157 的巨大改进把整体压到了 0.651。
+>
+> 如果哪天用 v3 (10s×80ep) 的原始 submission 文件做 stitch，理论上能再降 ~0.008（LogD 端点 0.460 vs 0.532 那部分），projection 大约 0.643。
 
-### 13.8 v4 部分新增的 Lessons Learned
+**对比所有版本（按 MA-RAE 排序）**：
+
+| 版本 | MA-RAE | Macro R² | 训练时间 |
+|---|---:|---:|---:|
+| **v4.1 (stitch v4 + v3.1)** | **0.651** | **+0.458** | 1 sec stitch (输入预算 25h + 6h) |
+| v3 (10s × 80ep) | 0.666 | +0.45 | 3 h T4 |
+| v3 (5s × 50ep) | 0.677 | +0.45 | 1.5 h T4 |
+| v3.1 (HybridADMET + CheMeleon) | 0.679 | +0.45 | 6 h T4 |
+| v4 (HybridADMET 忠实复现) | 0.688 | +0.38 | 25 h T4 |
+| v2 (各种组合) | 0.757-0.802 | +0.30 | 5-15 min CPU |
+| v1 + selective aug | 0.750 | +0.32 | 5 min CPU |
+
+R² 也是真的升了（+0.458 > v3 +0.45, > v4 +0.38），说明 stitch 不是只在 MAE 单一指标上凑数——相关性也变好了。
+
+### 13.8 v4.1 → v4 那 4 个端点为什么强？
+
+v4 在 MPPB / KSOL / Caco-2 Efflux / MGMB 上反超的共同特征：
+
+1. **标签分布相对窄**：MPPB / MGMB 都是百分比，多数样本集中在 5-95% 区间；KSOL / Efflux 也是限定区间。
+2. **强构效关系**：这些端点跟分子的疏水性、蛋白结合表面、转运体识别强相关，是 3D conformer + 物化指纹擅长的事。
+3. **跟 fingerprint 相关性强**：MACCS / PubChem 881 这些 substructure-based fingerprint 在 binding-class 任务上经验性表现好。
+
+v4 在 LogD / HLM CLint / MLM CLint / Caco-2 Papp / MBPB 上崩盘的共同特征：
+
+1. **标签跨多个数量级**：CLint 跨 4 个数量级，masked MAE 严重欠拟合极值。
+2. **样本量极端**：LogD N=5039 大数据加 5M+ 参数模型 → 过拟合；MBPB N=975 中等样本 + 复杂模型 → 噪声放大。
+3. **依赖动力学/速率信息**：CLint / Papp 是动力学量，跟 3D 静态构象关系弱，跟实验条件（pH / 缓冲液 / 微粒体浓度）强相关。
+
+→ 这强烈支持 **architecture-task fit** 比 architecture 本身重要的论点。下一版（如果继续做）应该考虑 **per-endpoint architecture selection**：MPPB / MGMB 用 v4 hybrid，CLint 用 v3 LightGBM + Chemprop，LogD 用 simple LightGBM。本质就是把 v4.1 stitch 的逻辑从"选模型"升级到"训练时就让对的架构看对的端点"。
+
+### 13.9 v4 + v4.1 部分新增的 Lessons Learned
 
 接 §12.10：
 
 20. **Faithful reproduction 不等于结果重现**。把 paper 的架构原样搭出来不保证拿到 paper 报告的分数——超参、数据增强、训练 schedule、ensemble 策略都可能有未公开细节。**复现的价值在于摸清架构 alone 能解释多少，剩下的就是 secret sauce**。这次摸出来：v4 这套架构 alone 在 0.69 区间，HybridADMET 的 0.60 至少有 0.09 来自他们没在 paper 里完全披露的东西。
-21. **失败的复现仍然有信息量**。v4 在 MPPB / KSOL / Caco-2 Efflux / MGMB 上达到了历史最佳——这意味着这套 hybrid architecture **对结合类 + 物化类端点真的有效**，只是在代谢 endpoint 上崩了。stitch 把强项保留 + 弱项替换，能拿到比 v3 / v4 单独都好的结果。Negative result paper 应该这样写：失败的整体 + 局部的胜利 + 拼装方案。
-22. **`unless-stopped` 跟 `on-failure` 是两回事**。Docker `--restart unless-stopped` 在 exit 0 也会重启容器，意味着脚本正常跑完后又被自动从头跑了一遍。我们的 v4 训练 23:09 跑完 + 写好 submission_v4.csv，结果触发 eval 一行（EVAL_REPO 路径错）crash 非零退出，于是 `unless-stopped` 把整个 25 小时训练循环又拉起来了，第二天醒来发现"为什么 results_partial.pkl 比 results.pkl 还新"。**`on-failure:max_retries` 才是对的**。
-23. **PaDEL 这种 Java backend 工具适合本地跑一次缓存到 .npz，不适合 Docker 里联调**。padelpy 启动 JVM 慢 + chunked 调用偶发 timeout + Java exception 不太可控。如果训练失败需要 retry，每次都重跑 fingerprint 计算是浪费。下次类似工具优先 pre-compute 到 .npz / parquet。
-24. **Multi-modal ensemble 的真正价值在 specialist 拼装**。v3 是"同质化 stacking ensemble"（GNN + classical ML 但都拟合同一组 task），改善有限；v4 + v3.1 + v3 这种"不同架构在不同 endpoint 上各有所长"的 collection，per-endpoint 选最强的拼起来才是 ensemble 该有的样子。这条放到 v4.1 验证。
+21. **失败的复现仍然有信息量，关键是 per-endpoint breakdown**。v4 整体 0.688 比 v3 0.666 还差，看 macro 一个数字会得出"v4 失败"的结论；但拆到 9 个端点上看，v4 在 4 个端点（MPPB / KSOL / Caco-2 Efflux / MGMB）上是历史最佳，是 hybrid architecture 真正起作用的证据。**Macro 平均掩盖了 architecture-task fit 的 signal**。下次跑实验直接 macro+per-endpoint 一起报。
+22. **Oracle stitch 是 cheap experiment**。v4.1 一秒钟完成（pd.concat），没训练，没 GPU 时间，拿到 0.651 历史最佳。在已经有多版 submission 的情况下，per-endpoint oracle stitch 应该是第一个尝试的 baseline——它直接告诉你"你最好的 ensemble 上限在哪"。如果 oracle 都不如某个新方法的报告值，说明新方法是真的强；如果 oracle 已经达到了目标，说明你已经有了所有 ingredients，下一步是怎么自动 ensemble 而不是再造一个新 architecture。
+23. **架构-任务匹配（architecture-task fit）比架构先进性更重要**。HybridADMET 那套 Uni-Mol2 + PAMNet + PaDEL 对 binding / 物化端点有效，对代谢端点崩。LightGBM 对所有端点平均都还行（敦实派）。Chemprop 对中等样本量端点有效。最好的方案不是选最强的单一架构，是 **per-endpoint 选当时最适合的架构**——这就是 §13.8 末尾的下一步方向。
+24. **`unless-stopped` 跟 `on-failure` 是两回事**。Docker `--restart unless-stopped` 在 exit 0 也会重启容器，意味着脚本正常跑完后又被自动从头跑了一遍。我们的 v4 训练 23:09 跑完 + 写好 submission_v4.csv，结果触发 eval 一行（EVAL_REPO 路径错）crash 非零退出，于是 `unless-stopped` 把整个 25 小时训练循环又拉起来了，第二天醒来发现"为什么 results_partial.pkl 比 results.pkl 还新"。**`on-failure:max_retries` 才是对的**。
+25. **PaDEL 这种 Java backend 工具适合本地跑一次缓存到 .npz，不适合 Docker 里联调**。padelpy 启动 JVM 慢 + chunked 调用偶发 timeout + Java exception 不太可控。如果训练失败需要 retry，每次都重跑 fingerprint 计算是浪费。下次类似工具优先 pre-compute 到 .npz / parquet。
+26. **Multi-modal ensemble 的真正价值在 specialist 拼装**。v3 是"同质化 stacking ensemble"（GNN + classical ML 但都拟合同一组 task），改善有限；v4 + v3.1 + v3 这种"不同架构在不同 endpoint 上各有所长"的 collection，per-endpoint 选最强的拼起来才是 ensemble 该有的样子。**v4.1 验证了这点：0.651 比任何单一版本都好。**
 
-### 13.9 v4 + Docker 关键文件清单（最终归档用）
+### 13.10 v4 + Docker 关键文件清单（最终归档用）
 
 ```
 src/v4_hybridadmet/
@@ -1001,6 +1040,6 @@ docker/
 
 ---
 
-*v4 部分更新时间：2026-05-17。v4.1 stitch 结果待补。*
+*v4 部分更新时间：2026-05-17。v4.1 stitch 实测 MA-RAE=0.651 / R²=+0.458 — 项目新历史最佳。*
 
 

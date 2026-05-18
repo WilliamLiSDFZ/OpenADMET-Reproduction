@@ -2,6 +2,7 @@
 # Docker entrypoint for openadmet-v4 image.
 #   docker run ... openadmet-v4:latest              # default: run v4 pipeline
 #   docker run ... openadmet-v4:latest v4           # explicit v4
+#   docker run ... openadmet-v4:latest v5           # Uni-Mol2-only ablation
 #   docker run ... openadmet-v4:latest v3           # run v3 pipeline instead
 #   docker run ... openadmet-v4:latest bash         # interactive shell
 #   docker run ... openadmet-v4:latest python ...   # arbitrary python cmd
@@ -23,6 +24,10 @@ case "$CMD" in
     v4)
         echo "[entrypoint] running: python -m src.v4_hybridadmet.run $@"
         exec python -m src.v4_hybridadmet.run "$@"
+        ;;
+    v5)
+        echo "[entrypoint] running: python -m src.v5_unimol.run $@"
+        exec python -m src.v5_unimol.run "$@"
         ;;
     v3)
         echo "[entrypoint] running: python -m src.v3.run $@"
