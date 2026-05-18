@@ -75,6 +75,27 @@ def train_one(group_name: str,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    ckpt_path = cfg.CKPT_DIR / f"{group_name}_seed{seed}.pt"
+
+    # ---- Fast-path: if a checkpoint already exists from a previous run,
+    #      just load it and run inference on test. Skips ~40 min of retrain.
+    if ckpt_path.exists() and ckpt_path.stat().st_size > 1024:
+        print(f"\n=== group={group_name} seed={seed}  "
+              f"FAST-PATH from {ckpt_path.name} (skip training) ===")
+        try:
+            return _inference_from_checkpoint(
+                ckpt_path=ckpt_path,
+                targets_in_group=targets_in_group,
+                test_features=test_features,
+                test_fingerprints=test_fingerprints,
+                seed=seed,
+                group_name=group_name,
+                device=device,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"  WARN: fast-path failed ({type(e).__name__}: {e}); "
+                  "falling back to full retrain")
+
     print(f"\n=== group={group_name} seed={seed}  targets={targets_in_group} ===")
 
     # ---- Build targets + mask --------------------------------------------
@@ -129,7 +150,7 @@ def train_one(group_name: str,
     best_val_mae = float("inf")
     patience = 10
     bad_epochs = 0
-    ckpt_path = cfg.CKPT_DIR / f"{group_name}_seed{seed}.pt"
+    # ckpt_path already defined at top of train_one
 
     for epoch in range(cfg.EPOCHS):
         lr_mult = _lr_schedule(epoch)
@@ -194,6 +215,7 @@ def train_one(group_name: str,
                 break
 
     # ---- Load best checkpoint and predict on test ------------------------
+    # (ckpt_path already defined at the top of train_one for fast-path)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -213,6 +235,62 @@ def train_one(group_name: str,
         "test_preds": test_preds,
         "best_val_mae": ckpt["val_mae"],
         "ckpt_path": str(ckpt_path),
+        "seed": seed,
+        "group_name": group_name,
+    }
+
+
+def _inference_from_checkpoint(ckpt_path, targets_in_group, test_features,
+                               test_fingerprints, seed, group_name, device):
+    """Skip training when a checkpoint already exists. Rebuild the model
+    architecture, load weights, predict on test, return the same dict
+    structure ``train_one`` would have returned.
+
+    Used by the resume path so that a container restart only re-trains
+    (group, seed) pairs that don't yet have a .pt on disk.
+    """
+    import numpy as np
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Rebuild the architecture identically to the training path
+    unimol = UniMol2Branch(model_variant=cfg.UNIMOL_MODEL_VARIANT,
+                            freeze=not cfg.UNIMOL_FINETUNE)
+    pamnet = PAMNetBranch(**cfg.PAMNET_CFG)
+    pamnet = extend_pamnet_embedding(pamnet, max_atomic_number=53)
+    fp_branch = FingerprintBranch(in_dim=FP_DIM, out_dim=cfg.DIM_FP_OUT)
+    model = HybridADMET(unimol, pamnet, fp_branch,
+                         n_tasks=len(targets_in_group),
+                         head_hidden=cfg.HEAD_HIDDEN,
+                         head_dropout=cfg.HEAD_DROPOUT).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+
+    te_ds = HybridADMETDataset(
+        test_features, test_fingerprints,
+        np.zeros((len(test_features), len(targets_in_group)), dtype=np.float32),
+        np.zeros((len(test_features), len(targets_in_group)), dtype=np.float32),
+    )
+    te_loader = DataLoader(te_ds, batch_size=cfg.BATCH_SIZE, shuffle=False,
+                            collate_fn=collate_hybrid, num_workers=2)
+    test_preds = []
+    with torch.no_grad():
+        for batch in te_loader:
+            batch = _to_device(batch, device)
+            pred = model({
+                "unimol_batch": batch["unimol_batch"],
+                "pamnet_data": batch["pamnet_data"],
+                "fp": batch["fp"],
+            })
+            test_preds.append(pred.cpu().numpy())
+    test_preds = np.concatenate(test_preds, axis=0)
+    print(f"  ✓ fast-path inference done  (val_mae from ckpt: {ckpt.get('val_mae', 'N/A')})")
+    return {
+        "targets": targets_in_group,
+        "test_preds": test_preds,
+        "best_val_mae": ckpt.get("val_mae", float("nan")),
+        "ckpt_path": str(ckpt_path),
+        "seed": seed,
+        "group_name": group_name,
     }
 
 
@@ -255,10 +333,32 @@ def train_all(train_df, test_df, device=None) -> dict:
         cache_path=cfg.CACHE_DIR / "fp_test.npy")
 
     # 3) For each unique HybridADMET group, train ENSEMBLE_SEEDS models
-    results = {}     # group_name -> list of per-seed result dicts
+    #
+    # RESUME: we incrementally save ``results_partial.pkl`` after every
+    # (group, seed) completes. If the container restarts mid-run we can
+    # pick up exactly where we left off rather than redoing everything.
+    import pickle
+    partial_path = cfg.V4_OUT / "results_partial.pkl"
+    results: dict = {}
+    if partial_path.exists():
+        try:
+            with open(partial_path, "rb") as f:
+                results = pickle.load(f)
+            done = sum(len(v) for v in results.values())
+            print(f"  RESUME: loaded {done} previously-completed (group, seed) "
+                  f"pairs from {partial_path}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  Couldn't read {partial_path} ({e}); starting fresh")
+            results = {}
+
     for group_name, targets in cfg.GROUP_TO_TARGETS.items():
-        results[group_name] = []
+        if group_name not in results:
+            results[group_name] = []
+        done_seeds = {r.get("seed") for r in results[group_name]}
         for seed in range(cfg.ENSEMBLE_SEEDS):
+            if seed in done_seeds:
+                print(f"  SKIP group={group_name} seed={seed} (cached)")
+                continue
             r = train_one(
                 group_name=group_name,
                 targets_in_group=targets,
@@ -272,4 +372,7 @@ def train_all(train_df, test_df, device=None) -> dict:
                 device=device,
             )
             results[group_name].append(r)
+            # Save after EVERY completion -- next restart picks up here
+            with open(partial_path, "wb") as f:
+                pickle.dump(results, f)
     return results

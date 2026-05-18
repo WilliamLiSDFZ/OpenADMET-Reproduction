@@ -165,8 +165,14 @@ def _load_unimol_dict():
                 continue
             d = Dictionary.load(str(dict_path))
             _UNIMOL_DICT_CACHE = d
-            print(f"  Loaded Uni-Mol2 dictionary via {mod_name}.Dictionary "
-                  f"({len(d)} tokens)")
+            # Print only once per process, not per DataLoader worker × batch
+            global _PRINTED_DICT_BANNER
+            try:
+                _PRINTED_DICT_BANNER
+            except NameError:
+                print(f"  Loaded Uni-Mol2 dictionary via {mod_name}.Dictionary "
+                      f"({len(d)} tokens)")
+                _PRINTED_DICT_BANNER = True
             return d
         except (ImportError, AttributeError, Exception):  # noqa: BLE001
             continue
