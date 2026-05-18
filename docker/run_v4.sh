@@ -40,7 +40,12 @@ case "$CMD" in
         docker run -d --name "$NAME" \
             --gpus all \
             --shm-size=8g \
-            --restart unless-stopped \
+            --restart on-failure:5 \
+            \
+            `# Restart only on CRASH (non-zero exit), max 5 attempts.` \
+            `# Previously used 'unless-stopped' which ALSO restarted on exit 0` \
+            `# — meaning the script kept re-running from scratch after each` \
+            `# successful completion. on-failure:5 stops cleanly on success.` \
             -v "$PROJ_DIR:/workspace" \
             -v "$PROJ_DIR/output:/workspace/output" \
             -v "$EVAL_REPO_HOST:/eval:ro" \

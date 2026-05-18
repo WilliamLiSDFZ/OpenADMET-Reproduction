@@ -53,6 +53,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-train", action="store_true",
                     help="reuse cached per-seed test predictions if present")
+    ap.add_argument("--eval", action="store_true",
+                    help="run official `python -m eval` after writing the submission. "
+                         "OFF by default — most servers don't have the eval repo "
+                         "and crashes here used to trigger `unless-stopped` restart "
+                         "loops. Set EVAL_REPO=/path/to/ExpansionRx-Challenge-Eval "
+                         "to enable.")
     args = ap.parse_args()
 
     print(f"v4 output dir: {cfg.V4_OUT}")
@@ -61,9 +67,8 @@ def main():
     print(f"  train={len(train_df)}  test={len(test_df)}")
 
     if not args.skip_train:
-        print("\n[1/3] Training all (group × seed) HybridADMET models")
+        print("\n[1/2] Training all (group × seed) HybridADMET models")
         results = train_all(train_df, test_df)
-        # Cache results so --skip-train works next time
         import pickle
         with open(cfg.V4_OUT / "results.pkl", "wb") as f:
             pickle.dump(results, f)
@@ -71,20 +76,26 @@ def main():
         import pickle
         with open(cfg.V4_OUT / "results.pkl", "rb") as f:
             results = pickle.load(f)
-        print("\n[1/3] Loaded cached training results")
+        print("\n[1/2] Loaded cached training results")
 
-    print("\n[2/3] Aggregating into submission")
+    print("\n[2/2] Aggregating into submission")
     submission = build_submission(results, test_df)
     sub_path = cfg.V4_OUT / "submission_v4.csv"
     submission.to_csv(sub_path, index=False)
-    print(f"  Wrote {sub_path}")
+    print(f"  ✓ Wrote {sub_path}")
+    print()
+    print("Done. To score, copy submission_v4.csv to a machine that has the")
+    print("official ExpansionRx-Challenge-Eval repo and run:")
+    print()
+    print("    cd ExpansionRx-Challenge-Eval")
+    print("    python -m eval /path/to/submission_v4.csv \\")
+    print("        --ground-truth /path/to/test_ground_truth.csv \\")
+    print("        --output /path/to/official_eval_v4.csv")
 
-    if cfg.GROUND_TRUTH_CSV.exists():
-        print("\n[3/3] Official eval")
+    # Opt-in eval (off by default)
+    if args.eval and cfg.GROUND_TRUTH_CSV.exists():
+        print("\n[opt-in] --eval requested; running official eval")
         run_official_eval(sub_path)
-    else:
-        print("\n[3/3] Skipping official eval (no ground truth file at "
-              f"{cfg.GROUND_TRUTH_CSV})")
 
 
 if __name__ == "__main__":

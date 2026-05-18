@@ -14,7 +14,9 @@ services:
       context: ..                       # project root, so COPY copies the source
       dockerfile: docker/Dockerfile
     container_name: openadmet-v4
-    restart: unless-stopped             # auto-restart if the host reboots
+    restart: on-failure:5               # restart on crash only, NOT on exit-0
+                                          # (avoids re-running the script from
+                                          #  scratch after successful completion)
     runtime: nvidia                     # NVIDIA Container Toolkit
     deploy:
       resources:
