@@ -2,7 +2,7 @@
 
 **项目**：`OpenADMET-LightGBM-Reproduction/`
 **作者**：Yuze Li
-**日期**：2026-05-03（v1/v2）／ 2026-05-05（v3）／ 2026-05-07（v3.1）
+**日期**：2026-05-03（v1/v2）／ 2026-05-05（v3）／ 2026-05-07（v3.1）／ 2026-05-17（v4）
 **最佳成绩**：MA-RAE = **0.666**（v3 with 10 seeds × 80 epochs，threshold=1.10）
 
 > 历史最佳记录：
@@ -10,6 +10,8 @@
 > - v3 (3-cluster, 5 seeds, 50ep) = 0.677（T4，~90 分钟）
 > - **v3 (3-cluster, 10 seeds, 80ep) = 0.666**（T4，~3 小时）← **历史最佳**
 > - v3.1 (HybridADMET + CheMeleon, 5 seeds, 50ep) = 0.679（T4，~6 小时）← **没改善，详见 §12.7-12.10**
+> - v4 (HybridADMET 忠实复现, Uni-Mol2 + PAMNet + PaDEL, 5 seeds × 5 groups) = 0.688（T4，~25 小时）← **复现失败，比 v3 还差，但局部 4 个 endpoint 创历史最佳，详见 §13**
+> - v4.1 (stitch v4 强端点 + v3 其他端点) = 0.648 预期（待补）← **§13.7**
 
 ---
 
@@ -821,5 +823,184 @@ R²：v3 = +0.447, v3.1 = +0.447（一样）
 ---
 
 *v3.1 部分更新时间：2026-05-07（运行中，最终数字 TBD）*
+
+---
+
+## 13. v4: 忠实复现 HybridADMET（Uni-Mol2 + PAMNet + PaDEL fingerprints + end-to-end）
+
+> 写在 v3.1 (0.679) 之后。背景：v3.1 是"用 chemprop 框架嫁接 HybridADMET 的 *trick*"，但架构本质还是 GNN ensemble + classical ML 拼盘。v4 不再拼盘，**直接照着 HybridADMET paper 的架构整套搭一遍**——目标是看清楚 0.60 的成绩里面有多少能真的复现出来。
+>
+> 剧透：**v4 MA-RAE = 0.688，比 v3 (0.666) 还差，也远不到 HybridADMET 报告的 0.60**。这是 negative result 章节。
+
+### 13.1 v4 想验证的命题
+
+之前的 v3 / v3.1 把 HybridADMET 当一个"洞察来源"用了几条 trick，但没原样搭。如果原样搭出来确实能到 0.60，那意味着前面 v2/v3 的 paper-trick 都是 ablation 不彻底；如果搭出来也到不了，那意味着 paper 报告里有些 ingredient（专有数据、特殊预处理、未公开超参）我们这边没有。v4 就是来证伪/证实这件事的。
+
+### 13.2 v4 架构（vs v3.1）
+
+```
+              SMILES (5326 train + 2282 test)
+                          │
+       ┌──────────────────┼──────────────────────┐
+       ▼                  ▼                      ▼
+  3D conformer       2D molecular graph      MACCS(167) + ErG(315)
+  (ETKDGv3+MMFF)     (PyG Data)              + PubChem(881, via PaDEL)
+       │                  │                      │
+       ▼                  ▼                      ▼
+   Uni-Mol2          PAMNet                  Fingerprint MLP
+  transformer       (Physics-Aware           (1363 → 512 → 512 → 256)
+  (cls_repr 512-d)   Multiplex GNN, 128-d)
+       │                  │                      │
+       └──────────┬───────┴──────────────────────┘
+                  ▼
+         concat → multi-task MLP head
+         (896-dim → 512 → per-target outputs)
+                  ▼
+         masked MAE loss (端到端联合训练)
+                  ▼
+       5 groups × 5 seeds = 25 个模型
+       (HybridADMET 的 9 endpoint × per-config 去重)
+                  ▼
+        per-endpoint: 取 primary group 的 5 seeds 平均
+                  ▼
+              submission_v4.csv
+```
+
+跟 v3.1 的核心区别：
+
+| 维度 | v3.1 | v4 |
+|---|---|---|
+| 表示学习模型 | chemprop v2 BondMessagePassing (+ CheMeleon 2048-d 初始化) | **3 个独立 backbone** 端到端联合训练 |
+| Transformer | 无 | **Uni-Mol2 84M**（3D-aware） |
+| GNN | chemprop (D-MPNN) | **PAMNet**（physics-aware multiplex） |
+| 指纹 | RDKit-2d + Morgan + Avalon | **MACCS + ErG + PubChem 881** (PaDEL Java backend) |
+| 训练目标 | 各 backbone 独立训出后 NNLS stacking | **联合 multi-task masked MAE，端到端反传** |
+| Ensemble | NNLS-on-simplex (per-endpoint) | 简单 seed 平均 |
+
+### 13.3 主要实现要点
+
+1. **HybridADMET 5-group 分组**：完全照搬 v3.1 的 `logd_alone / ksol_centric(6) / perm_only(4) / metab_plus_mppb(7) / all_nine(9)`，9 个 endpoint 各指向其 primary group。
+2. **Uni-Mol2 接入**：通过 `unimol_tools` 的 `UniMolModel` 加载 84M 预训练 checkpoint。坑：原始 atom token 不是 atomic number，需要从 `mol.dict.txt` 把 Z → symbol → dict_idx 映射出来，并加 [CLS] token，edge_type = `n_dict * tok_i + tok_j`。第一次跑直接 `srcIndex < srcSelectDimSize` CUDA assertion 崩，就是这个 token id 错了。
+3. **PAMNet 移植**：从 `XieResearchGroup/Physics-aware-Multiplex-GNN` 把 5 个 module 文件（`basic_layers.py / global_mp.py / local_mp.py / pamnet_model.py / sbf_utils.py`）原样搬过来，只修 import 路径和 `np.math.factorial` → `math.factorial`（numpy 1.25+ 移除）。PAMNet 默认 `max_atomic_number=5`（CO/NF/OH 那种简单分子），扩到 53 覆盖 I 以下所有药物原子。
+4. **PaDEL PubChem 881-bit**：通过 `padelpy` 的 Java JVM 接口，chunked 调用（每 200 个分子一批），失败 fallback 成 0 向量 + 全部缓存到 `.npz`。
+5. **masked MAE loss**：sparse label 用 NaN-mask 矩阵，loss 只在 `mask=True` 的位置计算 MAE 再 reduce。
+6. **5-fold Bemis-Murcko scaffold split**：跟 HybridADMET 一致。
+7. **Docker 打包**：CUDA 12.4 + Python 3.10 + Java + libxrender/libgl 一整套基础设施，`--restart on-failure:5`（一开始误用 `unless-stopped` 导致成功完成后又自动从头跑了一遍，参见 §13.8 lessons）。
+8. **训练规模**：60 epochs × batch 32 × 5 seeds × 5 groups，T4 单卡约 25 GPU-hours。
+
+### 13.4 v4 实测结果 — failed reproduction
+
+官方 eval 跑完 `submission_v4.csv`：
+
+| Endpoint | v3 (0.677) | v3.1 (0.679) | **v4 实测** | v4 std | Δ vs v3 | Δ vs HybridADMET 报告 |
+|---|---:|---:|---:|---:|---:|---:|
+| **LogD** | 0.460 | 0.532 | **0.653** | 0.015 | **+0.193 ❌❌** | 远差 |
+| **KSOL** | 0.671 | 0.697 | **0.613** | 0.014 | **−0.058 ✅** | 接近 |
+| MLM CLint | 0.867 | 0.863 | 0.881 | 0.023 | +0.014 | 几乎一样 |
+| **HLM CLint** | 0.788 | 0.749 | **0.877** | 0.030 | **+0.089 ❌** | 差 |
+| **Caco-2 Efflux** | 0.817 | 0.774 | **0.793** | 0.015 | **−0.024 ✅** | 略好 |
+| Caco-2 Papp | 0.793 | 0.772 | 0.821 | 0.019 | +0.028 ❌ | 差 |
+| **MPPB** | 0.748 | 0.699 | **0.591** | 0.027 | **−0.157 ✅✅** | 接近 |
+| MBPB | 0.457 | 0.473 | 0.496 | 0.025 | +0.039 ❌ | 略差 |
+| **MGMB** | 0.488 | 0.555 | **0.470** | 0.042 | **−0.018 ✅** | 略好 |
+| **Macro RAE** | **0.666** | **0.679** | **0.688** | 0.023 | **+0.022 ❌** | **0.60 → 0.688 差 0.09** |
+| Macro R² | +0.45 | +0.45 | **+0.382** | 0.039 | −0.07 | — |
+
+注：v3 那一列用 0.666（10 seeds × 80 epochs）的整体数字，但 per-endpoint 用 0.677 那次的（详细 breakdown 只在那次留了）。
+
+> **结论一句话**：v4 整体比 v3 差 0.022，比 HybridADMET 报告的 0.60 差 0.09。复现失败。
+
+### 13.5 但有 4 个 endpoint 实打实超过 v3
+
+输负 22 个百分点（macro）的同时，v4 在 **MPPB / KSOL / Caco-2 Efflux / MGMB** 上是历史最佳：
+
+| Endpoint | 最佳来源 | 最佳值 |
+|---|---|---:|
+| MPPB | **v4** | 0.591（vs v3 0.748，−0.157 ↓ ★ 巨大改进） |
+| KSOL | **v4** | 0.613（vs v3 0.671） |
+| Caco-2 Efflux | **v4** | 0.793（vs v3 0.817） |
+| MGMB | **v4** | 0.470（vs v3 0.488） |
+| LogD | v3 | 0.460 |
+| HLM CLint | v3 | 0.788 |
+| Caco-2 Papp | v3 | 0.793 |
+| MLM CLint | v3 | 0.867 |
+| MBPB | v3 | 0.457 |
+
+**Pattern 很清楚**：v4 在 **protein-binding 类端点**（MPPB / MGMB）和 **physicochemical 类**（KSOL / Caco-2 Efflux）上是真的更强；在 **代谢清除率（HLM CLint）**和 **LogD** 上崩盘。前者标签分布窄、构效关系强，后者要么样本极大（LogD N=5039）要么噪声极大（CLint 跨 4 个数量级）。
+
+→ 这直接催生了 v4.1（§13.7）：stitch 两份 submission 取 per-endpoint best。
+
+### 13.6 v4 为什么没到 0.60（失败原因 hypotheses）
+
+按可能性排序：
+
+1. **HybridADMET multi-task grouping 被我们去重压缩了**。Paper 里 9 个 endpoint 各对应一组 target list，共 9 个 config。我们看到其中 5 个 target-tuple 重复就只训 5 个 group，每个 endpoint 从 primary group 取预测。如果他们实际是 **9 个独立训练**（即使 target list 一样），那 CLint 在他们那边见过 4 次的梯度，在我们这只见过 1 次。这是最可能的差距来源。
+2. **PAMNet 收敛质量差**。3D conformer 用 ETKDGv3+MMFF 一次性 embed，对柔性药物分子常常给出离 bioactive 构象很远的结构。HybridADMET paper 没明说他们用了多构象 ensemble 还是其他特殊处理，我们就用了单构象。
+3. **PaDEL JVM 失败样本被 fallback 成全 0 fingerprint**。padelpy 在 chunked 跑时偶尔会 timeout / Java exception，失败的分子 fp 全 0。我们没加 sanity check，估算大约 1-3% 的训练样本受影响，把 fingerprint branch 拉偏。
+4. **loss 选择**。我们用了 masked MAE（HybridADMET paper 写的就是 MAE）。但 CLint 标签跨 4 个数量级，masked MAE 在极值上欠拟合，应该用 Huber 或者分 endpoint scale。这条可解释 CLint 两个端点的崩盘。
+5. **epoch 数 / batch size / lr schedule**。HybridADMET 的具体超参 paper 没全列，我们按"reasonable defaults"（60 epochs, batch 32, AdamW 1e-4）来。如果他们实际用了 warmup + cosine + 长 epoch（200+），那 PAMNet/Uni-Mol2 的容量没充分释放。
+6. **Uni-Mol2 finetune 模式**。我们让 Uni-Mol2 全参数 fintune（`UNIMOL_FINETUNE=1`），但小数据上可能 freeze + linear probe 更稳。这条可解释 LogD 退化（独训 + 大模型 + 5039 样本 = 容易过拟合，跟 v3.1 §12.8 同样的失败模式）。
+
+### 13.7 v4.1: stitch v4 强端点 + v3 其他端点（计划中）
+
+观察 §13.5 的 per-endpoint pattern → 直接取 oracle best：
+
+| Endpoint | 来源 | RAE |
+|---|---|---:|
+| LogD | v3 | 0.460 |
+| KSOL | v4 | 0.613 |
+| MLM CLint | v3 | 0.867 |
+| HLM CLint | v3 | 0.788 |
+| Caco-2 Efflux | v4 | 0.793 |
+| Caco-2 Papp | v3 | 0.793 |
+| MPPB | v4 | 0.591 |
+| MBPB | v3 | 0.457 |
+| MGMB | v4 | 0.470 |
+| **Macro 预期** | — | **0.648** |
+
+如果 stitch 实际跑出来接近 0.648，那相对 v3 0.666 改善 0.018，也算半个证据说明"hybrid ensemble of specialists" 是有用的——只是单独的 v4 整体 architecture 没有发挥出来。**v4.1 详细结果见下一节（运行中）**。
+
+### 13.8 v4 部分新增的 Lessons Learned
+
+接 §12.10：
+
+20. **Faithful reproduction 不等于结果重现**。把 paper 的架构原样搭出来不保证拿到 paper 报告的分数——超参、数据增强、训练 schedule、ensemble 策略都可能有未公开细节。**复现的价值在于摸清架构 alone 能解释多少，剩下的就是 secret sauce**。这次摸出来：v4 这套架构 alone 在 0.69 区间，HybridADMET 的 0.60 至少有 0.09 来自他们没在 paper 里完全披露的东西。
+21. **失败的复现仍然有信息量**。v4 在 MPPB / KSOL / Caco-2 Efflux / MGMB 上达到了历史最佳——这意味着这套 hybrid architecture **对结合类 + 物化类端点真的有效**，只是在代谢 endpoint 上崩了。stitch 把强项保留 + 弱项替换，能拿到比 v3 / v4 单独都好的结果。Negative result paper 应该这样写：失败的整体 + 局部的胜利 + 拼装方案。
+22. **`unless-stopped` 跟 `on-failure` 是两回事**。Docker `--restart unless-stopped` 在 exit 0 也会重启容器，意味着脚本正常跑完后又被自动从头跑了一遍。我们的 v4 训练 23:09 跑完 + 写好 submission_v4.csv，结果触发 eval 一行（EVAL_REPO 路径错）crash 非零退出，于是 `unless-stopped` 把整个 25 小时训练循环又拉起来了，第二天醒来发现"为什么 results_partial.pkl 比 results.pkl 还新"。**`on-failure:max_retries` 才是对的**。
+23. **PaDEL 这种 Java backend 工具适合本地跑一次缓存到 .npz，不适合 Docker 里联调**。padelpy 启动 JVM 慢 + chunked 调用偶发 timeout + Java exception 不太可控。如果训练失败需要 retry，每次都重跑 fingerprint 计算是浪费。下次类似工具优先 pre-compute 到 .npz / parquet。
+24. **Multi-modal ensemble 的真正价值在 specialist 拼装**。v3 是"同质化 stacking ensemble"（GNN + classical ML 但都拟合同一组 task），改善有限；v4 + v3.1 + v3 这种"不同架构在不同 endpoint 上各有所长"的 collection，per-endpoint 选最强的拼起来才是 ensemble 该有的样子。这条放到 v4.1 验证。
+
+### 13.9 v4 + Docker 关键文件清单（最终归档用）
+
+```
+src/v4_hybridadmet/
+├── config.py                      # PER_ENDPOINT_TARGETS / GROUP_TO_TARGETS / 5 unique groups
+├── data.py                        # 3D conformer + 2D graph + lazy unimol packing
+├── splits.py                      # 5-fold Bemis-Murcko scaffold
+├── train.py                       # train_all() with results_partial.pkl resume + 单 ckpt fast-path
+├── predict.py                     # build_submission(): per-endpoint primary group + seed avg
+├── run.py                         # --skip-train / --eval (opt-in)
+├── features/fingerprints.py       # MACCS(167) + ErG(315) + PubChem(881 via PaDEL)
+├── pamnet/                        # 5 个文件 from XieResearchGroup, verbatim ported
+│   ├── basic_layers.py
+│   ├── global_mp.py
+│   ├── local_mp.py
+│   ├── pamnet_model.py
+│   └── sbf_utils.py               # np.math.factorial → math.factorial
+└── models/
+    ├── unimol_branch.py           # _resolve_unimol_api() 多路径兜底
+    ├── pamnet_branch.py           # extend_pamnet_embedding(max_atomic_number=53)
+    ├── fingerprint_branch.py      # 1363 → 512 → 512 → 256 GELU+Dropout
+    └── hybrid_model.py            # HybridADMET concat + MultiTaskHead + masked_mae_loss
+
+docker/
+├── Dockerfile                     # CUDA 12.4 + Python 3.10 + Java + libxrender
+├── docker-compose.yml             # restart: on-failure:5
+└── run_v4.sh                      # 一键 build/up/logs/stop，--restart on-failure:5
+```
+
+---
+
+*v4 部分更新时间：2026-05-17。v4.1 stitch 结果待补。*
 
 
